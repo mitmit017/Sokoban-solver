@@ -1,0 +1,18 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest / Unittest cache
+.pytest_cache/
+
+# IDE config
+.vscode/
+.idea/
+
+# Benchmark output files (dữ liệu đo đạc tạm thời)
+*.csv
+benchmark_results/
+
+# File tạm Word/Office
+~$*
