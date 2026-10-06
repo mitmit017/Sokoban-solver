@@ -9,9 +9,90 @@ def heuristic(state):
     return 0
 
 
-def is_deadlock(state):
-    """Teammate hook: return True when this state should be pruned."""
+from collections import deque
+
+# Bốn hướng di chuyển, cùng thứ tự với sokoban.py: lên, phải, xuống, trái.
+_DL_DIRS = ((0, -1), (1, 0), (0, 1), (-1, 0))
+
+
+def _dl_is_wall(x, y, width, height, obstacles):
+    """Trả về True nếu ô (x, y) là tường: ngoài bàn chơi (biên) hoặc là obstacle."""
+    return x < 0 or y < 0 or x >= width or y >= height or (x, y) in obstacles
+
+
+# -----------------------------------------------------------------------------
+# LỚP 1 — Ô CHẾT TĨNH
+# -----------------------------------------------------------------------------
+def _compute_dead_cells(state):
+    """Tính tập ô chết tĩnh của map bằng Reverse BFS ("kéo" thùng ngược từ ô đích).
+
+    Ô chết: nếu một thùng nằm ở ô đó thì dù đẩy thế nào cũng KHÔNG THỂ tới được bất
+    kỳ ô đích nào (chỉ xét tường, bỏ qua thùng khác và robot).
+
+    Cách làm: bắt đầu từ mọi ô đích (luôn "sống"). Một cú đẩy thuận theo hướng d đưa
+    thùng từ p sang q = p + d, khi đó robot đứng ở r = p - d. Đảo ngược lại: từ q ta
+    tìm được p = q - d, với điều kiện p và r = q - 2d đều không phải tường. Ô nào
+    không bao giờ được tìm thấy là ô chết.
+
+    Vì bỏ qua thùng khác và robot nên tập ô chết tìm được là tập con chắc chắn của ô
+    chết thật -> an toàn (không báo nhầm). Khác với luật "góc là ô chết", cách này tự
+    xử lý đúng trường hợp góc có ô đích, tường trong bàn, bàn bị chia cắt...
+
+    Trả về: frozenset các ô (x, y) chết (không gồm ô tường).
+    """
+    width, height, obstacles = state.width, state.height, state.obstacles
+
+    # Ô đích hợp lệ là điểm xuất phát; chúng luôn sống nên không bao giờ là ô chết.
+    alive = {c for c in state.storage
+             if not _dl_is_wall(c[0], c[1], width, height, obstacles)}
+    queue = deque(alive)
+
+    while queue:
+        qx, qy = queue.popleft()
+        for dx, dy in _DL_DIRS:
+            px, py = qx - dx, qy - dy          # ô thùng đứng TRƯỚC cú đẩy
+            rx, ry = qx - 2 * dx, qy - 2 * dy  # ô robot phải đứng để thực hiện cú đẩy
+            if (px, py) in alive:
+                continue
+            if _dl_is_wall(px, py, width, height, obstacles):
+                continue
+            if _dl_is_wall(rx, ry, width, height, obstacles):
+                continue
+            alive.add((px, py))
+            queue.append((px, py))
+
+    # Ô chết = mọi ô trong bàn, không phải tường, và không nằm trong tập "sống".
+    return frozenset((x, y)
+                     for x in range(width) for y in range(height)
+                     if (x, y) not in obstacles and (x, y) not in alive)
+
+
+# -----------------------------------------------------------------------------
+# HÀM CHÍNH CHO NHÓM GỌI
+# -----------------------------------------------------------------------------
+def is_deadlock(state, dead_cells=None):
+    """Trả về True nếu `state` CHẮC CHẮN không thể giải được (nên cắt tỉa).
+
+    Tham số:
+        state:      một SokobanState.
+        dead_cells: tập ô chết từ _compute_dead_cells(initial_state). Nếu để None, hàm
+                    tự tính lại từ `state` (đúng nhưng chậm) và KHÔNG lưu kết quả giữa
+                    các lần gọi (không dùng biến toàn cục, theo ràng buộc của đề).
+
+    Hàm không sửa `state`. Trạng thái đích (mọi thùng đã trên ô đích) luôn trả False.
+    """
+    if dead_cells is None:
+        dead_cells = _compute_dead_cells(state)
+
+    # Lớp 1: có thùng nằm trên ô chết (ô đích không bao giờ là ô chết).
+    for box in state.boxes:
+        if box in dead_cells:
+            return True
     return False
+
+
+
+
 """
 abs(box[0] - s[0]) + abs(box[1] - s[1]): Đây là công thức tính Khoảng cách Manhattan.
 Tại sao? Trong Sokoban, bạn chỉ có thể đẩy hộp theo 4 hướng (Lên, Xuống, Trái, Phải), không thể đi chéo. Do đó, khoảng cách Manhattan là ước lượng chính xác nhất cho số bước di chuyển.
