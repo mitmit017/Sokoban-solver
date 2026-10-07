@@ -9,7 +9,7 @@ Cach chay nhanh (timebound nho hon): python benchmark.py --time 10
 import sys
 import time
 from sokoban import PROBLEMS
-from solution2 import solve
+from solution import solve
 from validation import validate_solution
 
 
