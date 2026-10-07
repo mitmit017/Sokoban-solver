@@ -1,4 +1,4 @@
-"""Student entry point. See README.md for the API and scoring rules."""
+"""Student entry point. See README.md for the API and scoring ffrules."""
 
 import heapq
 import time
