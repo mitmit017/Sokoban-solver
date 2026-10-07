@@ -3,11 +3,53 @@
 import heapq
 import time
 from sokoban import sokoban_goal_state
+from collections import deque
 
-def heuristic(state):
-    """Teammate hook: replace this with the heuristic implementation."""
-    return 0
+def heuristic(state, dist_table=None):
+    """Ước lượng chi phí né tường bằng dist_table của TV2."""
+    # Phòng vệ nếu người gọi truyền cả dict {"dist_table": ...}
+    if isinstance(dist_table, dict) and "dist_table" in dist_table:
+        dist_table = dist_table["dist_table"]
+    # Phòng vệ nếu TV1 gọi không truyền dist_table -> Tự động tính theo Manhattan
+    if dist_table is None:
+        return sum(
+            min(abs(b[0] - s[0]) + abs(b[1] - s[1]) for s in state.storage)
+            for b in state.boxes
+        )
+    total_distance = 0
+    for box in state.boxes:
+        min_dist = float("inf")
+        for target in state.storage:
+            d = dist_table[target].get(box, float("inf"))
+            if d < min_dist:
+                min_dist = d
+        # Nếu một thùng không thể tới bất kỳ đích nào -> Cắt nhánh thua ngay
+        if min_dist == float("inf"):
+            return float("inf")
+        total_distance += min_dist
+    return total_distance
 
+def precompute(initial_state):
+    """Tính trước bảng khoảng cách BFS từ các đích (chạy 1 lần duy nhất)."""
+    width = initial_state.width
+    height = initial_state.height
+    obstacles = initial_state.obstacles
+    storage = initial_state.storage
+    dist_table = {}
+    for target in storage:
+        distances = {}
+        queue = deque([(target, 0)])
+        distances[target] = 0
+        while queue:
+            (curr_x, curr_y), d = queue.popleft()
+            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nx, ny = curr_x + dx, curr_y + dy
+                if 0 <= nx < width and 0 <= ny < height:
+                    if (nx, ny) not in obstacles and (nx, ny) not in distances:
+                        distances[(nx, ny)] = d + 1
+                        queue.append(((nx, ny), d + 1))
+        dist_table[target] = distances
+    return {"dist_table": dist_table}
 
 def is_deadlock(state):
     """Teammate hook: return True when this state should be pruned."""
