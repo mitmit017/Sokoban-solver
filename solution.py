@@ -1,9 +1,46 @@
-"""Student entry point. See README.md for the API and scoring ffrules."""
-
+"""Student entry point. See README.md for the API and scoring rules."""
 import heapq
 import time
-from sokoban import sokoban_goal_state
 from collections import deque
+from sokoban import SokobanState, sokoban_goal_state
+def solve(initial_state, timebound=120):
+    """Try push-level search first on the largest maps, then fall back to A*."""
+    if timebound <= 0:
+        return False
+
+    start_time = time.perf_counter()
+    precomputed = precompute(initial_state)
+
+    if sokoban_goal_state(initial_state):
+        return initial_state
+
+    is_large_multi_box_map = (
+        initial_state.width * initial_state.height >= 64 and
+        len(initial_state.boxes) >= 6
+    )
+    if is_large_multi_box_map:
+        remaining = timebound - (time.perf_counter() - start_time)
+        push_budget = min(30.0, remaining * 0.25)
+        push_result = _push_search(initial_state, push_budget, precomputed)
+        if push_result is not False:
+            return push_result
+
+    remaining = timebound - (time.perf_counter() - start_time)
+    return _step_search(initial_state, remaining, precomputed)
+
+def precompute(initial_state):
+    """
+    Tinh truoc du lieu tinh cho ca map (chi chay 1 lan/map).
+    Tra ve dict chua:
+        'push_dist_table': dict[storage] -> dict[(x,y)] = so lan day toi thieu
+        'dead_cells': frozenset cac o ma day thung vao la thua cuoc
+    """
+    push_dist_table = _build_push_dist_table(initial_state)
+    dead_cells = _compute_dead_cells(initial_state)
+    return {
+        "push_dist_table": push_dist_table,
+        "dead_cells": dead_cells,
+    }
 
 def heuristic(state, dist_table=None):
     """Ước lượng chi phí né tường bằng dist_table của TV2."""
@@ -29,27 +66,7 @@ def heuristic(state, dist_table=None):
         total_distance += min_dist
     return total_distance
 
-def precompute(initial_state):
-    """Tính trước bảng khoảng cách BFS từ các đích (chạy 1 lần duy nhất)."""
-    width = initial_state.width
-    height = initial_state.height
-    obstacles = initial_state.obstacles
-    storage = initial_state.storage
-    dist_table = {}
-    for target in storage:
-        distances = {}
-        queue = deque([(target, 0)])
-        distances[target] = 0
-        while queue:
-            (curr_x, curr_y), d = queue.popleft()
-            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                nx, ny = curr_x + dx, curr_y + dy
-                if 0 <= nx < width and 0 <= ny < height:
-                    if (nx, ny) not in obstacles and (nx, ny) not in distances:
-                        distances[(nx, ny)] = d + 1
-                        queue.append(((nx, ny), d + 1))
-        dist_table[target] = distances
-    return {"dist_table": dist_table}
+
 
 def is_deadlock(state):
     """Teammate hook: return True when this state should be pruned."""
