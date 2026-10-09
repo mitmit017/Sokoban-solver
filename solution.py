@@ -147,6 +147,208 @@ Cách này dùng 40% thời gian đầu (Tier 1) để chạy Weighted A* ($w=2$
 Nếu map quá loằng ngoằng, Tier 1 chạy "bừa" mà không tới đích, ta dùng 60% thời gian còn lại (Tier 2) để gọi A* chuẩn ($w=1$), quét cẩn thận từng ngóc ngách như một phương án dự phòng (fallback).
 """
 
-def solve(initial_state, timebound=120):
-    return two_tier_search(initial_state, timebound=timebound)
+def _step_search(initial_state, timebound, precomputed):
+    """
+    Giai Sokoban bang Weighted A* (f = g + W*h).
+    Tra ve SokobanState dich (co parent chain day du), hoac False neu het
+    thoi gian. Khong thay doi initial_state, khong tao thread/process,
+    khong dung bien toan cuc giua cac lan goi.
+    """
+    start_time = time.time()
+
+    if timebound <= 0:
+        return False
+
+    WEIGHT = 4.0  # giai duoc 20/20 map trong 20s
+
+    push_dist_table = precomputed["push_dist_table"]
+    dead_cells = precomputed["dead_cells"]
+    assignment_cache = {}
+
+    def search_key(state):
+        return tuple(sorted(state.robots)), state.boxes
+
+    if sokoban_goal_state(initial_state):
+        return initial_state
+
+    # open list: (f_val, neg_g, count, state)
+    #   f_val = g + W*h : uu tien node co f nho nhat
+    #   neg_g = -gval    : cung f thi uu tien node di xa hon
+    #   count            : tranh heapq phai so sanh truc tiep SokobanState
+    counter = 0
+    g0 = initial_state.gval
+    h0 = _push_heuristic(initial_state, push_dist_table, assignment_cache)
+    if h0 == float("inf"):
+        return False
+    open_list = [(g0 + WEIGHT * h0, -g0, counter, initial_state)]
+
+    visited = {search_key(initial_state): g0}  # hashable_state -> gval tot nhat da biet
+
+    while open_list:
+        if time.time() - start_time >= timebound - 0.5:
+            return False
+
+        _, neg_g, _, current = heapq.heappop(open_list)
+        current_g = -neg_g
+
+        key = search_key(current)
+        if visited.get(key, float("inf")) < current_g:
+            continue  # node loi thoi, da co duong ngan hon toi cung cau hinh
+
+        if sokoban_goal_state(current):
+            return current
+
+        for next_state in current.successors():
+            next_key = search_key(next_state)
+            next_g = next_state.gval
+
+            if visited.get(next_key, float("inf")) <= next_g:
+                continue
+
+            if is_deadlock(next_state, dead_cells):
+                continue
+
+            visited[next_key] = next_g
+            counter += 1
+            next_h = _push_heuristic(
+                next_state, push_dist_table, assignment_cache)
+            if next_h == float("inf"):
+                continue
+            next_f = next_g + WEIGHT * next_h
+            heapq.heappush(open_list, (next_f, -next_g, counter, next_state))
+
+    return False
+
+def _push_successors(state, dead_cells, deadline):
+    """Yield legal pushes with their shortest local walking paths attached."""
+    width = state.width
+    height = state.height
+    directions = ((0, -1, "up"), (1, 0, "right"),
+                  (0, 1, "down"), (-1, 0, "left"))
+
+    for robot_index, start in enumerate(state.robots):
+        blocked = set(state.boxes) | set(state.obstacles)
+        blocked.update(robot for index, robot in enumerate(state.robots)
+                       if index != robot_index)
+        parents = {start: None}
+        queue = deque([start])
+
+        while queue and time.perf_counter() < deadline:
+            x, y = queue.popleft()
+            for dx, dy, direction_name in directions:
+                next_position = (x + dx, y + dy)
+                if not (0 <= next_position[0] < width and
+                        0 <= next_position[1] < height):
+                    continue
+                if next_position in blocked or next_position in parents:
+                    continue
+                parents[next_position] = ((x, y), direction_name)
+                queue.append(next_position)
+
+        for box in state.boxes:
+            if time.perf_counter() >= deadline:
+                return
+            for dx, dy, direction_name in directions:
+                stand = (box[0] - dx, box[1] - dy)
+                destination = (box[0] + dx, box[1] + dy)
+                if stand not in parents:
+                    continue
+                if not (0 <= destination[0] < width and
+                        0 <= destination[1] < height):
+                    continue
+                if destination in state.boxes or destination in state.obstacles:
+                    continue
+                if destination in state.robots:
+                    continue
+
+                walk = []
+                position = stand
+                while position != start:
+                    previous, walk_direction = parents[position]
+                    walk.append((position, walk_direction))
+                    position = previous
+
+                walking_state = state
+                for position, walk_direction in reversed(walk):
+                    robots = list(walking_state.robots)
+                    robots[robot_index] = position
+                    walking_state = SokobanState(
+                        f"{robot_index} {walk_direction}",
+                        walking_state.gval + 1,
+                        walking_state,
+                        width,
+                        height,
+                        tuple(robots),
+                        state.boxes,
+                        state.storage,
+                        state.obstacles,
+                    )
+
+                boxes = set(state.boxes)
+                boxes.remove(box)
+                boxes.add(destination)
+                robots = list(walking_state.robots)
+                robots[robot_index] = box
+                pushed_state = SokobanState(
+                    f"{robot_index} {direction_name}",
+                    walking_state.gval + 1,
+                    walking_state,
+                    width,
+                    height,
+                    tuple(robots),
+                    frozenset(boxes),
+                    state.storage,
+                    state.obstacles,
+                )
+                if not is_deadlock(pushed_state, dead_cells):
+                    yield pushed_state
+
+def _push_search(initial_state, timebound, precomputed):
+    """Search over pushes while retaining a legal unit-step parent chain."""
+    if timebound <= 0:
+        return False
+
+    deadline = time.perf_counter() + timebound
+    push_dist_table = precomputed["push_dist_table"]
+    dead_cells = precomputed["dead_cells"]
+    assignment_cache = {}
+    weight = 4.0
+
+    def search_key(state):
+        return tuple(sorted(state.robots)), state.boxes
+
+    initial_h = _push_heuristic(initial_state, push_dist_table, assignment_cache)
+    if initial_h == float("inf"):
+        return False
+
+    counter = 0
+    open_list = [(initial_state.gval + weight * initial_h,
+                  -initial_state.gval, counter, initial_state)]
+    visited = {search_key(initial_state): initial_state.gval}
+
+    while open_list and time.perf_counter() < deadline:
+        _, negative_g, _, current = heapq.heappop(open_list)
+        current_g = -negative_g
+        key = search_key(current)
+        if visited.get(key, float("inf")) < current_g:
+            continue
+        if sokoban_goal_state(current):
+            return current
+
+        for next_state in _push_successors(current, dead_cells, deadline):
+            next_key = search_key(next_state)
+            next_g = next_state.gval
+            if visited.get(next_key, float("inf")) <= next_g:
+                continue
+            next_h = _push_heuristic(
+                next_state, push_dist_table, assignment_cache)
+            if next_h == float("inf"):
+                continue
+            visited[next_key] = next_g
+            counter += 1
+            priority = next_g + weight * next_h
+            heapq.heappush(open_list,
+                           (priority, -next_g, counter, next_state))
+
+    return False
 
