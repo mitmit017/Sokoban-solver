@@ -3,6 +3,7 @@ import heapq
 import time
 from collections import deque
 from sokoban import SokobanState, sokoban_goal_state
+
 def solve(initial_state, timebound=120):
     """Try push-level search first on the largest maps, then fall back to A*."""
     if timebound <= 0:
@@ -41,6 +42,37 @@ def precompute(initial_state):
         "push_dist_table": push_dist_table,
         "dead_cells": dead_cells,
     }
+
+def _build_push_dist_table(initial_state):
+    """Return minimum static push counts from every cell to each storage."""
+    width = initial_state.width
+    height = initial_state.height
+    obstacles = initial_state.obstacles
+    directions = ((0, -1), (1, 0), (0, 1), (-1, 0))
+    per_storage = {}
+
+    for storage in initial_state.storage:
+        distances = {storage: 0}
+        queue = deque([storage])
+        while queue:
+            x, y = queue.popleft()
+            for dx, dy in directions:
+                previous_box = (x - dx, y - dy)
+                player_stand = (x - 2 * dx, y - 2 * dy)
+                if not (0 <= previous_box[0] < width and
+                        0 <= previous_box[1] < height and
+                        0 <= player_stand[0] < width and
+                        0 <= player_stand[1] < height):
+                    continue
+                if (previous_box in obstacles or player_stand in obstacles or
+                        previous_box in distances):
+                    continue
+                distances[previous_box] = distances[(x, y)] + 1
+                queue.append(previous_box)
+        per_storage[storage] = distances
+
+    return per_storage
+
 
 def heuristic(state, dist_table=None):
     """Ước lượng chi phí né tường bằng dist_table của TV2."""
