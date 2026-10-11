@@ -74,6 +74,45 @@ def _build_push_dist_table(initial_state):
     return per_storage
 
 
+
+def _compute_dead_cells(initial_state):
+    """
+    Tính tập 'dead_cells': ô nào đẩy thùng vào sẽ không bao giờ đưa được
+    tới bất kỳ ô đích nào nữa. Dùng Reverse BFS: bắt đầu từ các ô đích,
+    "kéo ngược" thùng ra ngoài (robot đứng ở phía đối diện với hướng kéo).
+    Ô nào không tới được bằng BFS ngược này là ô chết.
+    """
+    width = initial_state.width
+    height = initial_state.height
+    obstacles = initial_state.obstacles
+    storage = initial_state.storage
+
+    all_cells = frozenset(
+        (x, y)
+        for x in range(width)
+        for y in range(height)
+        if (x, y) not in obstacles
+    )
+
+    reachable = set(storage)
+    queue = deque(storage)
+    directions = [(0, -1), (1, 0), (0, 1), (-1, 0)]
+
+    while queue:
+        box = queue.popleft()
+        for dx, dy in directions:
+            prev_box = (box[0] - dx, box[1] - dy)      # vị trí thùng trước khi bị đẩy
+            robot_pos = (prev_box[0] - dx, prev_box[1] - dy)  # robot đứng phía ngoài để đẩy
+            if (prev_box in all_cells and
+                    robot_pos in all_cells and
+                    prev_box not in reachable):
+                reachable.add(prev_box)
+                queue.append(prev_box)
+
+    return frozenset(all_cells - reachable)
+
+
+
 def heuristic(state, dist_table=None):
     """Ước lượng chi phí né tường bằng dist_table của TV2."""
     # Phòng vệ nếu người gọi truyền cả dict {"dist_table": ...}
