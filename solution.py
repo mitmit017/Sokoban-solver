@@ -4,6 +4,7 @@ import time
 from collections import deque
 from sokoban import SokobanState, sokoban_goal_state
 
+
 def solve(initial_state, timebound=120):
     """Try push-level search first on the largest maps, then fall back to A*."""
     if timebound <= 0:
@@ -29,6 +30,7 @@ def solve(initial_state, timebound=120):
     remaining = timebound - (time.perf_counter() - start_time)
     return _step_search(initial_state, remaining, precomputed)
 
+
 def precompute(initial_state):
     """
     Tinh truoc du lieu tinh cho ca map (chi chay 1 lan/map).
@@ -42,6 +44,7 @@ def precompute(initial_state):
         "push_dist_table": push_dist_table,
         "dead_cells": dead_cells,
     }
+
 
 def _build_push_dist_table(initial_state):
     """Return minimum static push counts from every cell to each storage."""
@@ -74,13 +77,12 @@ def _build_push_dist_table(initial_state):
     return per_storage
 
 
-
 def _compute_dead_cells(initial_state):
     """
-    Tính tập 'dead_cells': ô nào đẩy thùng vào sẽ không bao giờ đưa được
-    tới bất kỳ ô đích nào nữa. Dùng Reverse BFS: bắt đầu từ các ô đích,
-    "kéo ngược" thùng ra ngoài (robot đứng ở phía đối diện với hướng kéo).
-    Ô nào không tới được bằng BFS ngược này là ô chết.
+    Tinh tap 'dead_cells': o nao day thung vao se khong bao gio dua duoc
+    toi bat ky o dich nao nua. Dung Reverse BFS: bat dau tu cac o dich,
+    "keo nguoc" thung ra ngoai (robot dung o phia doi dien voi huong keo).
+    O nao khong toi duoc bang BFS nguoc nay la o chet.
     """
     width = initial_state.width
     height = initial_state.height
@@ -101,8 +103,8 @@ def _compute_dead_cells(initial_state):
     while queue:
         box = queue.popleft()
         for dx, dy in directions:
-            prev_box = (box[0] - dx, box[1] - dy)      # vị trí thùng trước khi bị đẩy
-            robot_pos = (prev_box[0] - dx, prev_box[1] - dy)  # robot đứng phía ngoài để đẩy
+            prev_box = (box[0] - dx, box[1] - dy)      # vi tri thung truoc khi bi day
+            robot_pos = (prev_box[0] - dx, prev_box[1] - dy)  # robot dung phia ngoai de day
             if (prev_box in all_cells and
                     robot_pos in all_cells and
                     prev_box not in reachable):
@@ -112,111 +114,213 @@ def _compute_dead_cells(initial_state):
     return frozenset(all_cells - reachable)
 
 
+def _hungarian_min_cost(cost):
+    """
+    Kuhn-Munkres O(n^3) tren ma tran chi phi vuong NxN (co the dung inf
+    cho cap khong hop le). Tra ve (tong_chi_phi_toi_thieu, assignment)
+    voi assignment[i] = j nghia la hang i duoc gan cho cot j.
+    """
+    n = len(cost)
+    if n == 0:
+        return 0.0, []
 
-def heuristic(state, dist_table=None):
-    """Ước lượng chi phí né tường bằng dist_table của TV2."""
-    # Phòng vệ nếu người gọi truyền cả dict {"dist_table": ...}
-    if isinstance(dist_table, dict) and "dist_table" in dist_table:
-        dist_table = dist_table["dist_table"]
-    # Phòng vệ nếu TV1 gọi không truyền dist_table -> Tự động tính theo Manhattan
-    if dist_table is None:
-        return sum(
-            min(abs(b[0] - s[0]) + abs(b[1] - s[1]) for s in state.storage)
-            for b in state.boxes
-        )
-    total_distance = 0
-    for box in state.boxes:
-        min_dist = float("inf")
-        for target in state.storage:
-            d = dist_table[target].get(box, float("inf"))
-            if d < min_dist:
-                min_dist = d
-        # Nếu một thùng không thể tới bất kỳ đích nào -> Cắt nhánh thua ngay
-        if min_dist == float("inf"):
-            return float("inf")
-        total_distance += min_dist
-    return total_distance
+    BIG = 1e18  # thay cho inf de tranh loi so hoc trong thuat toan potentials
+    c = [[BIG if cost[i][j] == float("inf") else cost[i][j] for j in range(n)]
+         for i in range(n)]
+
+    u = [0.0] * (n + 1)
+    v = [0.0] * (n + 1)
+    p = [0] * (n + 1)
+    way = [0] * (n + 1)
+
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = [float("inf")] * (n + 1)
+        used = [False] * (n + 1)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = float("inf")
+            j1 = -1
+            for j in range(1, n + 1):
+                if not used[j]:
+                    cur = c[i0 - 1][j - 1] - u[i0] - v[j]
+                    if cur < minv[j]:
+                        minv[j] = cur
+                        way[j] = j0
+                    if minv[j] < delta:
+                        delta = minv[j]
+                        j1 = j
+            for j in range(0, n + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+
+    assignment = [0] * n
+    total = 0.0
+    for j in range(1, n + 1):
+        if p[j] != 0:
+            assignment[p[j] - 1] = j - 1
+            total += cost[p[j] - 1][j - 1]
+    return total, assignment
 
 
+def _push_heuristic(state, push_dist_table, assignment_cache):
+    """Estimate remaining pushes plus a lower bound on initial robot walking."""
+    boxes = tuple(sorted(box for box in state.boxes if box not in state.storage))
+    if not boxes:
+        return 0
 
-def is_deadlock(state):
-    """Teammate hook: return True when this state should be pruned."""
-    return False
-"""
-abs(box[0] - s[0]) + abs(box[1] - s[1]): Đây là công thức tính Khoảng cách Manhattan.
-Tại sao? Trong Sokoban, bạn chỉ có thể đẩy hộp theo 4 hướng (Lên, Xuống, Trái, Phải), không thể đi chéo. Do đó, khoảng cách Manhattan là ước lượng chính xác nhất cho số bước di chuyển.
-Tại sao lại dùng cách này? Để A* tìm được đường đi ngắn nhất (tối ưu), hàm heuristic bắt buộc phải là Admissible (luôn đánh giá ước lượng nhỏ hơn hoặc bằng số bước thực tế). Việc giả định "hộp bay xuyên tường đến đích gần nhất" chắc chắn tốn ít số bước hơn so với thực tế phải đẩy vòng vèo, do đó nó thỏa mãn điều kiện Admissible.
-"""
+    push_cost = assignment_cache.get(boxes)
+    if push_cost is None:
+        storages = tuple(state.storage)
+        box_count = len(boxes)
+        storage_count = len(storages)
+        size = max(box_count, storage_count)
+        costs = [[float("inf")] * size for _ in range(size)]
+
+        for row, box in enumerate(boxes):
+            for column, storage in enumerate(storages):
+                costs[row][column] = push_dist_table[storage].get(
+                    box, float("inf"))
+            for column in range(storage_count, size):
+                costs[row][column] = 0  # padding: hang/cot gia, chi phi 0
+
+        for row in range(box_count, size):
+            for column in range(size):
+                costs[row][column] = 0
+
+        push_cost, _ = _hungarian_min_cost(costs)
+        assignment_cache[boxes] = push_cost
+
+    if push_cost >= 1e17:
+        return float("inf")
+
+    nearest_robot_box = min(
+        abs(robot[0] - box[0]) + abs(robot[1] - box[1])
+        for robot in state.robots
+        for box in boxes
+    )
+    return int(push_cost) + max(0, nearest_robot_box - 1)
 
 
-def weighted_a_star(initial_state, timebound, weight=1.0):
-    deadline = time.time() + timebound
+def _is_frozen_deadlock(state):
+    """
+    Deadlock dong kieu "freeze de quy": mot o ke bi coi la chan VINH VIEN
+    neu la tuong/mep ban, HOAC la thung ma chinh thung do cung dong cung
+    tren CA HAI truc (hoan toan khong the di chuyen huong nao). Neu ca 2
+    phia tren 1 truc deu bi chan vinh vien thi thung dong cung truc do;
+    deadlock khi dong cung ca 2 truc va chua o dich.
 
-    if sokoban_goal_state(initial_state):
-        return initial_state
-    if timebound <= 0:
-        return False
+    Quan trong: phai doi hoi thung hang xom dong cung CA HAI truc, khong
+    chi truc dang xet — vi mot thung dong cung truc ngang van co the duoc
+    day DOC de roi di, lam cho vi tri do trong tro lai sau nay. Vi du: 3
+    thung L-B-R nam ngang, B ket doc that su (tuong tren/duoi truc tiep)
+    nhung L/R van con duong thoat doc -> khong phai deadlock that.
 
-    # open list: (f = g + w·h,  tie-break counter,  state)
-    counter = 0
-    open_list = []
-    h0 = heuristic(initial_state)
-    heapq.heappush(open_list, (initial_state.gval + weight * h0, counter, initial_state))
-    counter += 1
+    Mau 2x2 noi tu do (khong co tuong) duoc bat rieng boi _is_2x2_deadlock.
+    """
+    width = state.width
+    height = state.height
+    obstacles = state.obstacles
+    boxes = state.boxes
+    storage = state.storage
 
-    # closed: hashable_state → best g đã thấy
-    closed = {initial_state.hashable_state(): initial_state.gval}
+    def is_wall(x, y):
+        return x < 0 or x >= width or y < 0 or y >= height or (x, y) in obstacles
 
-    while open_list:
-        if time.time() >= deadline:
+    memo = {}   # (box, axis) -> bool
+
+    def frozen_on_axis(box, axis):
+        key = (box, axis)
+        if key in memo:
+            return memo[key]
+
+        memo[key] = True   # gia su dong cung truoc khi tinh, de xu ly chu ky
+
+        bx, by = box
+        neighbors = [(bx-1, by), (bx+1, by)] if axis == 0 else [(bx, by-1), (bx, by+1)]
+
+        for nx, ny in neighbors:
+            if is_wall(nx, ny):
+                continue
+            if ((nx, ny) in boxes
+                    and frozen_on_axis((nx, ny), 0)
+                    and frozen_on_axis((nx, ny), 1)):
+                continue
+            memo[key] = False
             return False
 
-        _, _, cur = heapq.heappop(open_list)
-        key = cur.hashable_state()
+        memo[key] = True
+        return True
 
-        # Đã có đường tốt hơn → bỏ qua
-        if closed.get(key, float('inf')) < cur.gval:
-            continue 
-        # tại sao lại có dòng này? Trong hàng đợi có thể có 2 phiên bản của cùng 1 trạng thái (do lúc mở rộng ta nhét vào, nhưng chưa kịp lấy ra thì đã tìm được đường khác ngắn hơn cũng chui vào hàng đợi). Dòng này để vứt bỏ phiên bản có đương đi dài hơn
-
-        if sokoban_goal_state(cur):
-            return cur
-
-        for succ in cur.successors():
-            if is_deadlock(succ):
-                continue
-
-            sk = succ.hashable_state()
-            sg = succ.gval
-            if sg < closed.get(sk, float('inf')):
-                closed[sk] = sg
-                f = sg + weight * heuristic(succ)
-                heapq.heappush(open_list, (f, counter, succ))
-                counter += 1
+    for box in boxes:
+        if box in storage:
+            continue
+        if frozen_on_axis(box, 0) and frozen_on_axis(box, 1):
+            return True
 
     return False
-"""
-Tại sao có weight? Trọng số $w$ giúp thuật toán "tham lam" hơn. Nếu $w=2$, A* sẽ coi trọng việc tiến gần đích ($h$) gấp đôi so với việc chắt chiu từng bước đi ($g$), giúp thuật toán lao tới đích nhanh hơn rất nhiều, bù lại đường đi có thể dài hơn (sub-optimal).
-Tại sao cần biến counter? Khi cho tuple (f, counter, state) vào heapq, nó sẽ sắp xếp theo $f$. Nếu hai state có $f$ bằng nhau, nó sẽ lấy phần tử thứ 2 (counter) ra so sánh. Nếu không có counter, nó sẽ so sánh 2 object SokobanState và Python sẽ báo lỗi sập chương trình vì nó không biết state nào "lớn hơn" state nào. counter tăng dần giúp phần tử nào được đưa vào hàng đợi trước sẽ được xét trước (FIFO).
-Tại sao dùng closed là Dictionary thay vì Set (Tập hợp)? Set chỉ lưu việc "trạng thái này đã đi qua hay chưa". Nhưng với Weighted A*, đôi khi bạn quay lại một trạng thái cũ nhưng qua một con đường ngắn hơn con đường lúc trước. Dùng dictionary lưu cặp Trạng_thái -> Số_bước_g_nhỏ_nhất giúp ta kiểm tra cực nhanh ($O(1)$) xem có nên cập nhật lại đường đi này hay không.
-Vòng lặp chạy liên tục rút trạng thái có $f$ nhỏ nhất ra. Hàm .hashable_state() thường chuyển các mảng toạ độ (thường là List/Tuple) thành string hoặc tuple cố định để có thể băm (hash) và làm key cho Dictionary.
-"""
 
-def two_tier_search(initial_state, timebound, weight=2.0, split=0.4):
-    budget1 = timebound * split
-    budget2 = timebound - budget1
 
-    # --- Tier 1: Weighted A* (nhanh) ---
-    result = weighted_a_star(initial_state, timebound=budget1, weight=weight)
-    if result:
-        return result
+def _is_2x2_deadlock(state):
+    """
+    Deadlock dong mau 2x2: neu 4 o hinh vuong lien ke deu bi chiem (thung,
+    tuong, hoac mep ban) va co it nhat 1 thung chua vao o dich -> deadlock
+    (khong the thao go). Bo sung cho truong hop _is_frozen_deadlock bo lot
+    (2x2 noi tu do, khong co tuong).
+    """
+    width = state.width
+    height = state.height
 
-    # --- Tier 2: standard A* (optimal) ---
-    return weighted_a_star(initial_state, timebound=budget2, weight=1.0)
-"""
-Cách này dùng 40% thời gian đầu (Tier 1) để chạy Weighted A* ($w=2$). Nó giống như "kẻ liều mạng", chạy thục mạng về phía đích mà không cần tính toán đường đi đẹp nhất. Thường nó sẽ giải được map rất nhanh. Đạt được mục tiêu: Có lời giải còn hơn là bị 0 điểm vì timeout.
-Nếu map quá loằng ngoằng, Tier 1 chạy "bừa" mà không tới đích, ta dùng 60% thời gian còn lại (Tier 2) để gọi A* chuẩn ($w=1$), quét cẩn thận từng ngóc ngách như một phương án dự phòng (fallback).
-"""
+    def is_blocked(x, y):
+        return x < 0 or x >= width or y < 0 or y >= height or (x, y) in state.boxes or (x, y) in state.obstacles
+
+    for bx, by in state.boxes:
+        for dx, dy in [(0, 0), (-1, 0), (0, -1), (-1, -1)]:
+            cx, cy = bx + dx, by + dy
+            corners = [(cx, cy), (cx+1, cy), (cx, cy+1), (cx+1, cy+1)]
+            if not all(is_blocked(x, y) for x, y in corners):
+                continue
+            for cx2, cy2 in corners:
+                if (0 <= cx2 < width and 0 <= cy2 < height and
+                        (cx2, cy2) in state.boxes and
+                        (cx2, cy2) not in state.storage):
+                    return True
+    return False
+
+
+def is_deadlock(state, dead_cells=None):
+    """
+    3 lop kiem tra, theo thu tu:
+      1. Deadlock tinh: thung nam trong 'dead_cells' (tinh truoc 1 lan/map).
+      2. Freeze de quy: thung dong cung ca 2 truc.
+      3. Mau 2x2: 4 o lien ke bi chiem, co thung chua vao dich.
+
+    TUYET DOI khong tra True nham (false positive) — se lam mat loi giai!
+    """
+    if dead_cells is not None:
+        for box in state.boxes:
+            if box not in state.storage and box in dead_cells:
+                return True
+
+    if _is_frozen_deadlock(state):
+        return True
+
+    return _is_2x2_deadlock(state)
+
 
 def _step_search(initial_state, timebound, precomputed):
     """
@@ -289,6 +393,7 @@ def _step_search(initial_state, timebound, precomputed):
             heapq.heappush(open_list, (next_f, -next_g, counter, next_state))
 
     return False
+
 
 def _push_successors(state, dead_cells, deadline):
     """Yield legal pushes with their shortest local walking paths attached."""
@@ -374,6 +479,7 @@ def _push_successors(state, dead_cells, deadline):
                 if not is_deadlock(pushed_state, dead_cells):
                     yield pushed_state
 
+
 def _push_search(initial_state, timebound, precomputed):
     """Search over pushes while retaining a legal unit-step parent chain."""
     if timebound <= 0:
@@ -422,4 +528,3 @@ def _push_search(initial_state, timebound, precomputed):
                            (priority, -next_g, counter, next_state))
 
     return False
-
