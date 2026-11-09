@@ -1,294 +1,443 @@
-"""Student entry point. See README.md for the API and scoring rules."""
+
 import heapq
 import time
 from collections import deque
 from sokoban import SokobanState, sokoban_goal_state
 
+_DIRECTIONS = ((0, -1, "up"), (1, 0, "right"),
+               (0, 1, "down"), (-1, 0, "left"))
+_WEIGHT = 3.0
+_CACHE_LIMIT = 100000
+_IMPROVEMENT_WEIGHTS = (2.0, 1.4, 1.0)
+_IMPROVEMENT_STATE_LIMIT = 100000
+
+
+class _Timeout(Exception):
+    pass
+
+
+class _SearchLimit(_Timeout):
+    pass
+
+
+def _check_time(deadline):
+    if time.perf_counter() >= deadline:
+        raise _Timeout
+
+
+class _Node:
+    __slots__ = ("robots", "boxes", "cost", "parent", "actions")
+
+    def __init__(self, robots, boxes, cost, parent=None, actions=()):
+        self.robots = robots
+        self.boxes = boxes
+        self.cost = cost
+        self.parent = parent
+        self.actions = actions
+
+
+class _Board:
+    def __init__(self, initial, deadline, full_matching):
+        self.width = initial.width
+        self.height = initial.height
+        self.storage = initial.storage
+        self.obstacles = initial.obstacles
+        self.deadline = deadline
+        self.full_matching = full_matching
+        self.neighbors = {}
+        for y in range(self.height):
+            _check_time(deadline)
+            for x in range(self.width):
+                if (x, y) in self.obstacles:
+                    continue
+                self.neighbors[x, y] = tuple(
+                    (x + dx, y + dy)
+                    if (0 <= x + dx < self.width and 0 <= y + dy < self.height
+                        and (x + dx, y + dy) not in self.obstacles) else None
+                    for dx, dy, _ in _DIRECTIONS)
+        self.goals = tuple(sorted(self.storage))
+        self.push_distances = {}
+        reachable = set()
+        for goal in self.goals:
+            distances = {goal: 0}
+            queue = deque([goal])
+            while queue:
+                _check_time(deadline)
+                cell = queue.popleft()
+                for direction in range(4):
+                    previous = self.neighbors[cell][direction]
+                    if previous is None:
+                        continue
+                    support = self.neighbors[previous][direction]
+                    if support is None or previous in distances:
+                        continue
+                    distances[previous] = distances[cell] + 1
+                    queue.append(previous)
+            self.push_distances[goal] = distances
+            reachable.update(distances)
+        self.dead_cells = frozenset(self.neighbors).difference(reachable)
+        self.assignment_cache = {}
+        self.deadlock_cache = {}
+
+    def deadlocked(self, boxes):
+        _check_time(self.deadline)
+        cached = self.deadlock_cache.get(boxes)
+        if cached is not None:
+            return cached
+        result = (bool(boxes & self.dead_cells)
+                  or _is_frozen_deadlock(boxes, self)
+                  or _is_2x2_deadlock(boxes, self))
+        if len(self.deadlock_cache) >= _CACHE_LIMIT:
+            self.deadlock_cache.clear()
+        self.deadlock_cache[boxes] = result
+        return result
+
+    def estimate(self, robots, boxes, deadline):
+        _check_time(deadline)
+        if boxes <= self.storage:
+            return 0
+        selected_boxes = boxes if self.full_matching else boxes - self.storage
+        push_cost = self.assignment_cache.get(selected_boxes)
+        if push_cost is None:
+            if len(selected_boxes) > len(self.goals):
+                return float("inf")
+            costs = []
+            for box in sorted(selected_boxes):
+                _check_time(deadline)
+                costs.append([self.push_distances[goal].get(box, float("inf"))
+                              for goal in self.goals])
+            costs.extend([[0] * len(self.goals)
+                          for _ in range(len(self.goals) - len(costs))])
+            push_cost, _ = _hungarian_min_cost(costs, deadline)
+            if len(self.assignment_cache) >= _CACHE_LIMIT:
+                self.assignment_cache.clear()
+            self.assignment_cache[selected_boxes] = push_cost
+        if push_cost == float("inf"):
+            return push_cost
+        # Before the first push, a robot must reach some box, including goal boxes.
+        approach = min(abs(rx-bx) + abs(ry-by)
+                       for rx, ry in robots for bx, by in boxes)
+        return int(push_cost) + max(0, approach - 1)
+
+
+def _step_successors(node, board, deadline):
+    for robot_index, position in enumerate(node.robots):
+        other_robots = set(node.robots)
+        other_robots.remove(position)
+        for direction, destination in enumerate(board.neighbors[position]):
+            _check_time(deadline)
+            if destination is None or destination in other_robots:
+                continue
+            boxes = node.boxes
+            if destination in boxes:
+                box_destination = board.neighbors[destination][direction]
+                if (box_destination is None or box_destination in boxes
+                        or box_destination in other_robots):
+                    continue
+                boxes = (boxes - {destination}) | {box_destination}
+                if board.deadlocked(boxes):
+                    continue
+            robots = list(node.robots)
+            robots[robot_index] = destination
+            yield tuple(robots), boxes, ((robot_index, direction),)
+
+
+def _push_successors(node, board, deadline):
+    for robot_index, position in enumerate(node.robots):
+        other_robots = set(node.robots)
+        other_robots.remove(position)
+        blocked = node.boxes | other_robots
+        parents = {position: None}
+        queue = deque([position])
+        while queue:
+            _check_time(deadline)
+            cell = queue.popleft()
+            for direction, neighbor in enumerate(board.neighbors[cell]):
+                if neighbor is not None and neighbor not in blocked and neighbor not in parents:
+                    parents[neighbor] = (cell, direction)
+                    queue.append(neighbor)
+        for box in sorted(node.boxes):
+            for direction, destination in enumerate(board.neighbors[box]):
+                _check_time(deadline)
+                stand = board.neighbors[box][(direction + 2) % 4]
+                if (stand not in parents or destination is None
+                        or destination in blocked):
+                    continue
+                boxes = (node.boxes - {box}) | {destination}
+                if board.deadlocked(boxes):
+                    continue
+                actions = []
+                cell = stand
+                while cell != position:
+                    _check_time(deadline)
+                    cell, walk_direction = parents[cell]
+                    actions.append((robot_index, walk_direction))
+                actions.reverse()
+                actions.append((robot_index, direction))
+                robots = list(node.robots)
+                robots[robot_index] = box
+                yield tuple(robots), boxes, tuple(actions)
+
+
+def _search(initial, board, deadline, pushes, stats, weight=_WEIGHT,
+            best_cost_bound=float('inf'), state_limit=None):
+    stats['searches'].append('push' if pushes else 'step')
+    root = _Node(initial.robots, initial.boxes, initial.gval)
+    if board.deadlocked(root.boxes):
+        return None
+    estimate = board.estimate(root.robots, root.boxes, deadline)
+    if estimate == float('inf') or root.cost + estimate >= best_cost_bound:
+        return None
+    frontier = [(root.cost + weight * estimate, -root.cost, 0, root)]
+    best_cost = {(tuple(sorted(root.robots)), root.boxes): root.cost}
+    serial = 0
+    successors = _push_successors if pushes else _step_successors
+    while frontier:
+        _check_time(deadline)
+        _, _, _, current = heapq.heappop(frontier)
+        key = (tuple(sorted(current.robots)), current.boxes)
+        if best_cost.get(key, float('inf')) < current.cost:
+            continue
+        if current.boxes <= board.storage:
+            return current
+        stats['expanded'] += 1
+        for robots, boxes, actions in successors(current, board, deadline):
+            stats['generated'] += 1
+            cost = current.cost + len(actions)
+            key = (tuple(sorted(robots)), boxes)
+            if best_cost.get(key, float('inf')) <= cost:
+                continue
+            estimate = board.estimate(robots, boxes, deadline)
+            if estimate == float('inf') or cost + estimate >= best_cost_bound:
+                continue
+            if state_limit is not None and key not in best_cost and len(best_cost) >= state_limit:
+                raise _SearchLimit
+            best_cost[key] = cost
+            serial += 1
+            node = _Node(robots, boxes, cost, current, actions)
+            heapq.heappush(frontier, (cost + weight * estimate, -cost, serial, node))
+        stats['peak_frontier'] = max(stats['peak_frontier'], len(frontier))
+    return None
+
+
+def _reconstruct(initial, node, deadline):
+    segments = []
+    while node.parent is not None:
+        _check_time(deadline)
+        segments.append(node.actions)
+        node = node.parent
+    current = initial
+    for actions in reversed(segments):
+        for robot_index, direction in actions:
+            _check_time(deadline)
+            dx, dy, name = _DIRECTIONS[direction]
+            x, y = current.robots[robot_index]
+            destination = (x + dx, y + dy)
+            robots = list(current.robots)
+            robots[robot_index] = destination
+            boxes = current.boxes
+            if destination in boxes:
+                boxes = (boxes - {destination}) | {(destination[0]+dx, destination[1]+dy)}
+            current = SokobanState(f'{robot_index} {name}', current.gval + 1,
+                                   current, initial.width, initial.height,
+                                   tuple(robots), boxes, initial.storage, initial.obstacles)
+    return current
+
 
 def solve(initial_state, timebound=120):
-    """Try push-level search first on the largest maps, then fall back to A*."""
+    """Return a legal goal chain or False. Does not guarantee move optimality."""
+    return _solve(initial_state, timebound)
+
+
+def _solve(initial_state, timebound=120, *, full_matching=True,
+           single_robot_push=True, stats=None):
+    """Private switches support controlled experiments; caches remain call-local."""
+    if stats is None:
+        stats = {}
+    stats.update(expanded=0, generated=0, peak_frontier=0, searches=[],
+                 first_steps=None, improvements=[], improvement_stop=None)
     if timebound <= 0:
         return False
-
-    start_time = time.perf_counter()
-    precomputed = precompute(initial_state)
-
+    deadline = time.perf_counter() + timebound - min(0.02, timebound * 0.02)
+    # Reserve time for releasing the frontier and reconstructing the final path.
+    search_deadline = deadline - min(1.0, timebound * 0.1)
     if sokoban_goal_state(initial_state):
         return initial_state
+    best_solution = False
+    try:
+        board = _Board(initial_state, search_deadline, full_matching)
+        single_robot = len(initial_state.robots) == 1 and single_robot_push
+        large_map = initial_state.width * initial_state.height >= 64 and len(initial_state.boxes) >= 6
+        node = None
+        if single_robot:
+            node = _search(initial_state, board, search_deadline, True, stats)
+        else:
+            # Multiple robots may need walking-only moves to make way for one another.
+            if large_map:
+                push_deadline = min(search_deadline, time.perf_counter() +
+                                    min(30.0, (search_deadline-time.perf_counter()) * 0.25))
+                try:
+                    node = _search(initial_state, board, push_deadline, True, stats)
+                except _Timeout:
+                    pass
+            if node is None:
+                node = _search(initial_state, board, search_deadline, False, stats)
+        if node is not None:
+            # Materialize a valid fallback BEFORE starting optional searches.
+            best_solution = _reconstruct(initial_state, node, deadline)
+            stats['first_steps'] = best_solution.gval
+            node = None
+        if best_solution is False:
+            return False
 
-    is_large_multi_box_map = (
-        initial_state.width * initial_state.height >= 64 and
-        len(initial_state.boxes) >= 6
-    )
-    if is_large_multi_box_map:
-        remaining = timebound - (time.perf_counter() - start_time)
-        push_budget = min(30.0, remaining * 0.25)
-        push_result = _push_search(initial_state, push_budget, precomputed)
-        if push_result is not False:
-            return push_result
-
-    remaining = timebound - (time.perf_counter() - start_time)
-    return _step_search(initial_state, remaining, precomputed)
-
-
-def precompute(initial_state):
-    """
-    Tinh truoc du lieu tinh cho ca map (chi chay 1 lan/map).
-    Tra ve dict chua:
-        'push_dist_table': dict[storage] -> dict[(x,y)] = so lan day toi thieu
-        'dead_cells': frozenset cac o ma day thung vao la thua cuoc
-    """
-    push_dist_table = _build_push_dist_table(initial_state)
-    dead_cells = _compute_dead_cells(initial_state)
-    return {
-        "push_dist_table": push_dist_table,
-        "dead_cells": dead_cells,
-    }
-
-
-def _build_push_dist_table(initial_state):
-    """Return minimum static push counts from every cell to each storage."""
-    width = initial_state.width
-    height = initial_state.height
-    obstacles = initial_state.obstacles
-    directions = ((0, -1), (1, 0), (0, 1), (-1, 0))
-    per_storage = {}
-
-    for storage in initial_state.storage:
-        distances = {storage: 0}
-        queue = deque([storage])
-        while queue:
-            x, y = queue.popleft()
-            for dx, dy in directions:
-                previous_box = (x - dx, y - dy)
-                player_stand = (x - 2 * dx, y - 2 * dy)
-                if not (0 <= previous_box[0] < width and
-                        0 <= previous_box[1] < height and
-                        0 <= player_stand[0] < width and
-                        0 <= player_stand[1] < height):
-                    continue
-                if (previous_box in obstacles or player_stand in obstacles or
-                        previous_box in distances):
-                    continue
-                distances[previous_box] = distances[(x, y)] + 1
-                queue.append(previous_box)
-        per_storage[storage] = distances
-
-    return per_storage
-
-
-def _compute_dead_cells(initial_state):
-    """
-    Tinh tap 'dead_cells': o nao day thung vao se khong bao gio dua duoc
-    toi bat ky o dich nao nua. Dung Reverse BFS: bat dau tu cac o dich,
-    "keo nguoc" thung ra ngoai (robot dung o phia doi dien voi huong keo).
-    O nao khong toi duoc bang BFS nguoc nay la o chet.
-    """
-    width = initial_state.width
-    height = initial_state.height
-    obstacles = initial_state.obstacles
-    storage = initial_state.storage
-
-    all_cells = frozenset(
-        (x, y)
-        for x in range(width)
-        for y in range(height)
-        if (x, y) not in obstacles
-    )
-
-    reachable = set(storage)
-    queue = deque(storage)
-    directions = [(0, -1), (1, 0), (0, 1), (-1, 0)]
-
-    while queue:
-        box = queue.popleft()
-        for dx, dy in directions:
-            prev_box = (box[0] - dx, box[1] - dy)      # vi tri thung truoc khi bi day
-            robot_pos = (prev_box[0] - dx, prev_box[1] - dy)  # robot dung phia ngoai de day
-            if (prev_box in all_cells and
-                    robot_pos in all_cells and
-                    prev_box not in reachable):
-                reachable.add(prev_box)
-                queue.append(prev_box)
-
-    return frozenset(all_cells - reachable)
+        # Keep automatic GC enabled. Bound optional work and leave extra time
+        # to release its frontier; no hard real-time guarantee is claimed.
+        improvement_deadline = min(search_deadline,
+            deadline - min(max(1.0, timebound * 0.05), timebound * 0.2))
+        remaining = improvement_deadline - time.perf_counter()
+        if remaining <= 0:
+            return best_solution
+        start = time.perf_counter()
+        # Restart each search with the tighter incumbent bound. Multi-robot
+        # improvements use step search so robots can walk out of each other's way.
+        for weight, fraction in zip(_IMPROVEMENT_WEIGHTS, (0.35, 0.70, 1.0)):
+            phase_deadline = min(improvement_deadline, start + remaining * fraction)
+            while time.perf_counter() < phase_deadline:
+                try:
+                    node = _search(initial_state, board, phase_deadline,
+                        single_robot, stats, weight, best_solution.gval,
+                        _IMPROVEMENT_STATE_LIMIT)
+                    if node is None:
+                        stats['improvement_stop'] = 'bounded_search_exhausted'
+                        return best_solution
+                    candidate = _reconstruct(initial_state, node, deadline)
+                    if candidate.gval < best_solution.gval:
+                        best_solution = candidate
+                        stats['improvements'].append((weight, candidate.gval))
+                    node = None
+                except _SearchLimit:
+                    stats['improvement_stop'] = 'state_limit'
+                    break
+                except _Timeout:
+                    stats['improvement_stop'] = 'phase_timeout'
+                    break
+    except _Timeout:
+        pass
+    return best_solution
 
 
-def _hungarian_min_cost(cost):
-    """
-    Kuhn-Munkres O(n^3) tren ma tran chi phi vuong NxN (co the dung inf
-    cho cap khong hop le). Tra ve (tong_chi_phi_toi_thieu, assignment)
-    voi assignment[i] = j nghia la hang i duoc gan cho cot j.
-    """
-    n = len(cost)
-    if n == 0:
+def _hungarian_min_cost(cost, deadline):
+    """Find a minimum-cost assignment for a square matrix in O(n^3).
+
+    Return (total_cost, assignment), where assignment[row] is its column.
+    Infinite costs represent forbidden pairs."""
+    matrix_size = len(cost)
+    if matrix_size == 0:
         return 0.0, []
 
-    BIG = 1e18  # thay cho inf de tranh loi so hoc trong thuat toan potentials
-    c = [[BIG if cost[i][j] == float("inf") else cost[i][j] for j in range(n)]
-         for i in range(n)]
+    INFINITE_COST = 1e18  # Avoid invalid arithmetic when updating potentials.
+    cost_matrix = [
+        [INFINITE_COST if cost[row][col] == float("inf") else cost[row][col]
+         for col in range(matrix_size)]
+        for row in range(matrix_size)
+    ]
 
-    u = [0.0] * (n + 1)
-    v = [0.0] * (n + 1)
-    p = [0] * (n + 1)
-    way = [0] * (n + 1)
+    row_potential = [0.0] * (matrix_size + 1)
+    col_potential = [0.0] * (matrix_size + 1)
+    matched_row = [0] * (matrix_size + 1)
+    previous_col = [0] * (matrix_size + 1)
 
-    for i in range(1, n + 1):
-        p[0] = i
-        j0 = 0
-        minv = [float("inf")] * (n + 1)
-        used = [False] * (n + 1)
+    for row in range(1, matrix_size + 1):
+        _check_time(deadline)
+        matched_row[0] = row
+        current_col = 0
+        min_slack = [float("inf")] * (matrix_size + 1)
+        visited_cols = [False] * (matrix_size + 1)
         while True:
-            used[j0] = True
-            i0 = p[j0]
-            delta = float("inf")
-            j1 = -1
-            for j in range(1, n + 1):
-                if not used[j]:
-                    cur = c[i0 - 1][j - 1] - u[i0] - v[j]
-                    if cur < minv[j]:
-                        minv[j] = cur
-                        way[j] = j0
-                    if minv[j] < delta:
-                        delta = minv[j]
-                        j1 = j
-            for j in range(0, n + 1):
-                if used[j]:
-                    u[p[j]] += delta
-                    v[j] -= delta
+            _check_time(deadline)
+            visited_cols[current_col] = True
+            current_row = matched_row[current_col]
+            potential_step = float("inf")
+            next_col = -1
+            for col in range(1, matrix_size + 1):
+                if not visited_cols[col]:
+                    reduced_cost = (
+                        cost_matrix[current_row - 1][col - 1]
+                        - row_potential[current_row] - col_potential[col]
+                    )
+                    if reduced_cost < min_slack[col]:
+                        min_slack[col] = reduced_cost
+                        previous_col[col] = current_col
+                    if min_slack[col] < potential_step:
+                        potential_step = min_slack[col]
+                        next_col = col
+            for col in range(0, matrix_size + 1):
+                if visited_cols[col]:
+                    row_potential[matched_row[col]] += potential_step
+                    col_potential[col] -= potential_step
                 else:
-                    minv[j] -= delta
-            j0 = j1
-            if p[j0] == 0:
+                    min_slack[col] -= potential_step
+            current_col = next_col
+            if matched_row[current_col] == 0:
                 break
         while True:
-            j1 = way[j0]
-            p[j0] = p[j1]
-            j0 = j1
-            if j0 == 0:
+            next_col = previous_col[current_col]
+            matched_row[current_col] = matched_row[next_col]
+            current_col = next_col
+            if current_col == 0:
                 break
 
-    assignment = [0] * n
-    total = 0.0
-    for j in range(1, n + 1):
-        if p[j] != 0:
-            assignment[p[j] - 1] = j - 1
-            total += cost[p[j] - 1][j - 1]
-    return total, assignment
+    assignment = [0] * matrix_size
+    total_cost = 0.0
+    for col in range(1, matrix_size + 1):
+        if matched_row[col] != 0:
+            assignment[matched_row[col] - 1] = col - 1
+            total_cost += cost[matched_row[col] - 1][col - 1]
+    return total_cost, assignment
 
+def _is_frozen_deadlock(boxes, board):
+    """Find a mutually frozen set; one fixed neighbor blocks an entire axis.
 
-def _push_heuristic(state, push_dist_table, assignment_cache):
-    """Estimate remaining pushes plus a lower bound on initial robot walking."""
-    boxes = tuple(sorted(box for box in state.boxes if box not in state.storage))
-    if not boxes:
-        return 0
-
-    push_cost = assignment_cache.get(boxes)
-    if push_cost is None:
-        storages = tuple(state.storage)
-        box_count = len(boxes)
-        storage_count = len(storages)
-        size = max(box_count, storage_count)
-        costs = [[float("inf")] * size for _ in range(size)]
-
-        for row, box in enumerate(boxes):
-            for column, storage in enumerate(storages):
-                costs[row][column] = push_dist_table[storage].get(
-                    box, float("inf"))
-            for column in range(storage_count, size):
-                costs[row][column] = 0  # padding: hang/cot gia, chi phi 0
-
-        for row in range(box_count, size):
-            for column in range(size):
-                costs[row][column] = 0
-
-        push_cost, _ = _hungarian_min_cost(costs)
-        assignment_cache[boxes] = push_cost
-
-    if push_cost >= 1e17:
-        return float("inf")
-
-    nearest_robot_box = min(
-        abs(robot[0] - box[0]) + abs(robot[1] - box[1])
-        for robot in state.robots
-        for box in boxes
-    )
-    return int(push_cost) + max(0, nearest_robot_box - 1)
-
-
-def _is_frozen_deadlock(state):
+    Remove boxes with a potentially free axis until the set stops changing.
+    No remaining box can be pushed first: on each axis, either its destination
+    or the robot's support square is occupied by a wall or a remaining box.
+    Goal boxes participate as blockers but are not themselves a deadlock.
     """
-    Deadlock dong kieu "freeze de quy": mot o ke bi coi la chan VINH VIEN
-    neu la tuong/mep ban, HOAC la thung ma chinh thung do cung dong cung
-    tren CA HAI truc (hoan toan khong the di chuyen huong nao). Neu ca 2
-    phia tren 1 truc deu bi chan vinh vien thi thung dong cung truc do;
-    deadlock khi dong cung ca 2 truc va chua o dich.
-
-    Quan trong: phai doi hoi thung hang xom dong cung CA HAI truc, khong
-    chi truc dang xet — vi mot thung dong cung truc ngang van co the duoc
-    day DOC de roi di, lam cho vi tri do trong tro lai sau nay. Vi du: 3
-    thung L-B-R nam ngang, B ket doc that su (tuong tren/duoi truc tiep)
-    nhung L/R van con duong thoat doc -> khong phai deadlock that.
-
-    Mau 2x2 noi tu do (khong co tuong) duoc bat rieng boi _is_2x2_deadlock.
-    """
-    width = state.width
-    height = state.height
-    obstacles = state.obstacles
-    boxes = state.boxes
-    storage = state.storage
+    width = board.width
+    height = board.height
+    obstacles = board.obstacles
+    storage = board.storage
 
     def is_wall(x, y):
         return x < 0 or x >= width or y < 0 or y >= height or (x, y) in obstacles
 
-    memo = {}   # (box, axis) -> bool
+    frozen = set(boxes)
 
-    def frozen_on_axis(box, axis):
-        key = (box, axis)
-        if key in memo:
-            return memo[key]
+    def blocked(x, y):
+        return is_wall(x, y) or (x, y) in frozen
 
-        memo[key] = True   # gia su dong cung truoc khi tinh, de xu ly chu ky
-
-        bx, by = box
-        neighbors = [(bx-1, by), (bx+1, by)] if axis == 0 else [(bx, by-1), (bx, by+1)]
-
-        for nx, ny in neighbors:
-            if is_wall(nx, ny):
-                continue
-            if ((nx, ny) in boxes
-                    and frozen_on_axis((nx, ny), 0)
-                    and frozen_on_axis((nx, ny), 1)):
-                continue
-            memo[key] = False
-            return False
-
-        memo[key] = True
-        return True
-
-    for box in boxes:
-        if box in storage:
-            continue
-        if frozen_on_axis(box, 0) and frozen_on_axis(box, 1):
-            return True
-
+    while frozen:
+        removable = set()
+        for x, y in frozen:
+            _check_time(board.deadline)
+            horizontal = blocked(x - 1, y) or blocked(x + 1, y)
+            vertical = blocked(x, y - 1) or blocked(x, y + 1)
+            if not (horizontal and vertical):
+                removable.add((x, y))
+        if not removable:
+            return bool(frozen - storage)
+        frozen.difference_update(removable)
     return False
 
-
-def _is_2x2_deadlock(state):
-    """
-    Deadlock dong mau 2x2: neu 4 o hinh vuong lien ke deu bi chiem (thung,
-    tuong, hoac mep ban) va co it nhat 1 thung chua vao o dich -> deadlock
-    (khong the thao go). Bo sung cho truong hop _is_frozen_deadlock bo lot
-    (2x2 noi tu do, khong co tuong).
-    """
-    width = state.width
-    height = state.height
+def _is_2x2_deadlock(boxes, board):
+    """Detect a solid 2x2 block containing at least one non-goal box."""
+    width = board.width
+    height = board.height
 
     def is_blocked(x, y):
-        return x < 0 or x >= width or y < 0 or y >= height or (x, y) in state.boxes or (x, y) in state.obstacles
+        return x < 0 or x >= width or y < 0 or y >= height or (x, y) in boxes or (x, y) in board.obstacles
 
-    for bx, by in state.boxes:
+    for bx, by in boxes:
         for dx, dy in [(0, 0), (-1, 0), (0, -1), (-1, -1)]:
             cx, cy = bx + dx, by + dy
             corners = [(cx, cy), (cx+1, cy), (cx, cy+1), (cx+1, cy+1)]
@@ -296,235 +445,7 @@ def _is_2x2_deadlock(state):
                 continue
             for cx2, cy2 in corners:
                 if (0 <= cx2 < width and 0 <= cy2 < height and
-                        (cx2, cy2) in state.boxes and
-                        (cx2, cy2) not in state.storage):
+                        (cx2, cy2) in boxes and
+                        (cx2, cy2) not in board.storage):
                     return True
-    return False
-
-
-def is_deadlock(state, dead_cells=None):
-    """
-    3 lop kiem tra, theo thu tu:
-      1. Deadlock tinh: thung nam trong 'dead_cells' (tinh truoc 1 lan/map).
-      2. Freeze de quy: thung dong cung ca 2 truc.
-      3. Mau 2x2: 4 o lien ke bi chiem, co thung chua vao dich.
-
-    TUYET DOI khong tra True nham (false positive) — se lam mat loi giai!
-    """
-    if dead_cells is not None:
-        for box in state.boxes:
-            if box not in state.storage and box in dead_cells:
-                return True
-
-    if _is_frozen_deadlock(state):
-        return True
-
-    return _is_2x2_deadlock(state)
-
-
-def _step_search(initial_state, timebound, precomputed):
-    """
-    Giai Sokoban bang Weighted A* (f = g + W*h).
-    Tra ve SokobanState dich (co parent chain day du), hoac False neu het
-    thoi gian. Khong thay doi initial_state, khong tao thread/process,
-    khong dung bien toan cuc giua cac lan goi.
-    """
-    start_time = time.time()
-
-    if timebound <= 0:
-        return False
-
-    WEIGHT = 4.0  # giai duoc 20/20 map trong 20s
-
-    push_dist_table = precomputed["push_dist_table"]
-    dead_cells = precomputed["dead_cells"]
-    assignment_cache = {}
-
-    def search_key(state):
-        return tuple(sorted(state.robots)), state.boxes
-
-    if sokoban_goal_state(initial_state):
-        return initial_state
-
-    # open list: (f_val, neg_g, count, state)
-    #   f_val = g + W*h : uu tien node co f nho nhat
-    #   neg_g = -gval    : cung f thi uu tien node di xa hon
-    #   count            : tranh heapq phai so sanh truc tiep SokobanState
-    counter = 0
-    g0 = initial_state.gval
-    h0 = _push_heuristic(initial_state, push_dist_table, assignment_cache)
-    if h0 == float("inf"):
-        return False
-    open_list = [(g0 + WEIGHT * h0, -g0, counter, initial_state)]
-
-    visited = {search_key(initial_state): g0}  # hashable_state -> gval tot nhat da biet
-
-    while open_list:
-        if time.time() - start_time >= timebound - 0.5:
-            return False
-
-        _, neg_g, _, current = heapq.heappop(open_list)
-        current_g = -neg_g
-
-        key = search_key(current)
-        if visited.get(key, float("inf")) < current_g:
-            continue  # node loi thoi, da co duong ngan hon toi cung cau hinh
-
-        if sokoban_goal_state(current):
-            return current
-
-        for next_state in current.successors():
-            next_key = search_key(next_state)
-            next_g = next_state.gval
-
-            if visited.get(next_key, float("inf")) <= next_g:
-                continue
-
-            if is_deadlock(next_state, dead_cells):
-                continue
-
-            visited[next_key] = next_g
-            counter += 1
-            next_h = _push_heuristic(
-                next_state, push_dist_table, assignment_cache)
-            if next_h == float("inf"):
-                continue
-            next_f = next_g + WEIGHT * next_h
-            heapq.heappush(open_list, (next_f, -next_g, counter, next_state))
-
-    return False
-
-
-def _push_successors(state, dead_cells, deadline):
-    """Yield legal pushes with their shortest local walking paths attached."""
-    width = state.width
-    height = state.height
-    directions = ((0, -1, "up"), (1, 0, "right"),
-                  (0, 1, "down"), (-1, 0, "left"))
-
-    for robot_index, start in enumerate(state.robots):
-        blocked = set(state.boxes) | set(state.obstacles)
-        blocked.update(robot for index, robot in enumerate(state.robots)
-                       if index != robot_index)
-        parents = {start: None}
-        queue = deque([start])
-
-        while queue and time.perf_counter() < deadline:
-            x, y = queue.popleft()
-            for dx, dy, direction_name in directions:
-                next_position = (x + dx, y + dy)
-                if not (0 <= next_position[0] < width and
-                        0 <= next_position[1] < height):
-                    continue
-                if next_position in blocked or next_position in parents:
-                    continue
-                parents[next_position] = ((x, y), direction_name)
-                queue.append(next_position)
-
-        for box in state.boxes:
-            if time.perf_counter() >= deadline:
-                return
-            for dx, dy, direction_name in directions:
-                stand = (box[0] - dx, box[1] - dy)
-                destination = (box[0] + dx, box[1] + dy)
-                if stand not in parents:
-                    continue
-                if not (0 <= destination[0] < width and
-                        0 <= destination[1] < height):
-                    continue
-                if destination in state.boxes or destination in state.obstacles:
-                    continue
-                if destination in state.robots:
-                    continue
-
-                walk = []
-                position = stand
-                while position != start:
-                    previous, walk_direction = parents[position]
-                    walk.append((position, walk_direction))
-                    position = previous
-
-                walking_state = state
-                for position, walk_direction in reversed(walk):
-                    robots = list(walking_state.robots)
-                    robots[robot_index] = position
-                    walking_state = SokobanState(
-                        f"{robot_index} {walk_direction}",
-                        walking_state.gval + 1,
-                        walking_state,
-                        width,
-                        height,
-                        tuple(robots),
-                        state.boxes,
-                        state.storage,
-                        state.obstacles,
-                    )
-
-                boxes = set(state.boxes)
-                boxes.remove(box)
-                boxes.add(destination)
-                robots = list(walking_state.robots)
-                robots[robot_index] = box
-                pushed_state = SokobanState(
-                    f"{robot_index} {direction_name}",
-                    walking_state.gval + 1,
-                    walking_state,
-                    width,
-                    height,
-                    tuple(robots),
-                    frozenset(boxes),
-                    state.storage,
-                    state.obstacles,
-                )
-                if not is_deadlock(pushed_state, dead_cells):
-                    yield pushed_state
-
-
-def _push_search(initial_state, timebound, precomputed):
-    """Search over pushes while retaining a legal unit-step parent chain."""
-    if timebound <= 0:
-        return False
-
-    deadline = time.perf_counter() + timebound
-    push_dist_table = precomputed["push_dist_table"]
-    dead_cells = precomputed["dead_cells"]
-    assignment_cache = {}
-    weight = 4.0
-
-    def search_key(state):
-        return tuple(sorted(state.robots)), state.boxes
-
-    initial_h = _push_heuristic(initial_state, push_dist_table, assignment_cache)
-    if initial_h == float("inf"):
-        return False
-
-    counter = 0
-    open_list = [(initial_state.gval + weight * initial_h,
-                  -initial_state.gval, counter, initial_state)]
-    visited = {search_key(initial_state): initial_state.gval}
-
-    while open_list and time.perf_counter() < deadline:
-        _, negative_g, _, current = heapq.heappop(open_list)
-        current_g = -negative_g
-        key = search_key(current)
-        if visited.get(key, float("inf")) < current_g:
-            continue
-        if sokoban_goal_state(current):
-            return current
-
-        for next_state in _push_successors(current, dead_cells, deadline):
-            next_key = search_key(next_state)
-            next_g = next_state.gval
-            if visited.get(next_key, float("inf")) <= next_g:
-                continue
-            next_h = _push_heuristic(
-                next_state, push_dist_table, assignment_cache)
-            if next_h == float("inf"):
-                continue
-            visited[next_key] = next_g
-            counter += 1
-            priority = next_g + weight * next_h
-            heapq.heappush(open_list,
-                           (priority, -next_g, counter, next_state))
-
     return False
