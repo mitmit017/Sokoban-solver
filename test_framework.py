@@ -21,14 +21,16 @@ class FrameworkTests(unittest.TestCase):
         self.assertTrue(validate_solution(start, goal)[0])
 
     def test_no_double_push(self):
-        self.assertNotIn("0 right", [s.action for s in board(boxes=((1, 1), (2, 1))).successors()])
+        start = board(boxes=((1, 1), (2, 1)), storage=((2, 1), (3, 1)))
+        self.assertNotIn("0 right", [s.action for s in start.successors()])
 
     def test_robot_blocks_push(self):
         start = board(robots=((0, 1), (2, 1)))
         self.assertNotIn("0 right", [s.action for s in start.successors()])
 
     def test_obstacle_blocks_push(self):
-        self.assertNotIn("0 right", [s.action for s in board(obstacles=((2, 1),)).successors()])
+        start = board(obstacles=((2, 1),), storage=((3, 1),))
+        self.assertNotIn("0 right", [s.action for s in start.successors()])
 
     def test_multiple_robots_move_one_at_a_time(self):
         start = board(robots=((0, 1), (3, 2)))

@@ -1,191 +1,159 @@
+"""Tests for the current push-distance heuristic.
+
+Run: python test_heuristic.py
+Admissibility means h(state) <= the optimal remaining move count.
+These finite checks do not prove admissibility for every possible board.
 """
-TEST TAY DANH CHO THANH VIEN 2 — Kiem tra ham heuristic().
+import unittest
+import time
+from collections import deque
+from itertools import permutations
 
-Cach chay: python test_heuristic.py
-Ket qua mong doi: tat ca PASS.
-
-Nguyen tac kiem tra admissible:
-    h(state) <= so buoc toi uu thuc te
-    => h(state) <= 0 neu da o dich
-    => h(state) > 0 neu chua o dich
-"""
-import sys
-from sokoban import SokobanState
-from solution import heuristic, precompute
+from sokoban import SokobanState, sokoban_goal_state
+from solution import _Board
+from validation import signature
 
 
-def make_state(robots, boxes, storage, width=6, height=6, obstacles=()):
-    return SokobanState(
-        "TEST", 0, None, width, height,
-        tuple(robots), frozenset(boxes), frozenset(storage), frozenset(obstacles)
-    )
+def make_state(robots, boxes, storage, width=4, height=3, obstacles=()):
+    """Build a valid test board; reject accidental overlapping pieces."""
+    robots = tuple(robots)
+    boxes = frozenset(boxes)
+    storage = frozenset(storage)
+    obstacles = frozenset(obstacles)
+    cells = set(robots) | boxes | storage | obstacles
+    if not robots or len(set(robots)) != len(robots):
+        raise ValueError("Robots must be nonempty and distinct")
+    if set(robots) & boxes or (set(robots) | boxes | storage) & obstacles:
+        raise ValueError("Pieces must not overlap boxes or walls")
+    if len(storage) < len(boxes):
+        raise ValueError("There must be at least as many goals as boxes")
+    if any(not (0 <= x < width and 0 <= y < height) for x, y in cells):
+        raise ValueError("Coordinates must be inside the board")
+    return SokobanState("TEST", 0, None, width, height,
+                        robots, boxes, storage, obstacles)
 
 
-def check(desc, state, expected_h, relation="=="):
+def estimate(state, cache=None):
+    deadline = time.perf_counter() + 10
+    board = _Board(state, deadline)
+    if cache is not None:
+        board.assignment_cache = cache
+    return board.estimate(state.robots, state.boxes, deadline)
+
+
+def optimal_moves(initial_state, max_states=50000):
+    """Find exact cost using unit-step BFS, without solver heuristics/pruning.
+
+    Return None only when the reachable state space is exhausted.
+    A safety-limit failure must not be mistaken for an unsolvable board.
     """
-    Kiem tra gia tri heuristic voi ky vong.
-    relation: '==' (chinh xac), '<=' (khong qua lon), '>0' (duong)
-    """
-    precomputed = precompute(state)
-    h = heuristic(state, precomputed["dist_table"])
-    if relation == "==":
-        ok = (h == expected_h)
-    elif relation == "<=":
-        ok = (h <= expected_h)
-    elif relation == ">0":
-        ok = (h > 0)
-    else:
-        ok = False
-
-    status = "PASS" if ok else "FAIL"
-    print(f"[{status}] {desc}")
-    print(f"        h = {h}, ky vong {relation} {expected_h}")
-    if not ok:
-        sys.exit(1)
+    queue = deque([initial_state])
+    seen = {initial_state.hashable_state()}
+    while queue:
+        state = queue.popleft()
+        if sokoban_goal_state(state):
+            return state.gval - initial_state.gval
+        for successor in state.successors():
+            key = successor.hashable_state()
+            if key in seen:
+                continue
+            seen.add(key)
+            if len(seen) > max_states:
+                raise AssertionError("BFS safety limit exceeded; use a smaller board")
+            queue.append(successor)
+    return None
 
 
-print("=" * 60)
-print("KIEM TRA HEURISTIC — Thanh vien 2")
-print("=" * 60)
+class HeuristicTests(unittest.TestCase):
+    def assert_admissible(self, state):
+        optimum = optimal_moves(state)
+        self.assertIsNotNone(optimum, "This fixture must be solvable")
+        value = estimate(state)
+        self.assertGreaterEqual(value, 0)
+        self.assertLessEqual(value, optimum)
+        return optimum
 
-# ----------------------------------------------------------
-# TC1: Thung da o dich => h phai = 0
-# ----------------------------------------------------------
-s1 = make_state(
-    robots=[(0, 0)],
-    boxes=[(2, 2)],
-    storage=[(2, 2)],  # Thung va dich trung nhau
-)
-check("TC1: Thung da o dich → h = 0", s1, 0, "==")
+    def test_goal_and_extra_storage(self):
+        state = make_state([(0, 0)], [(1, 1)], [(1, 1), (3, 2)])
+        self.assertEqual(estimate(state), 0)
+        self.assertEqual(optimal_moves(state), 0)
 
-# ----------------------------------------------------------
-# TC2: 1 thung, 1 dich, khoang cach Manhattan = 1
-# ----------------------------------------------------------
-s2 = make_state(
-    robots=[(0, 0)],
-    boxes=[(1, 0)],
-    storage=[(2, 0)],  # Cach 1 buoc sang phai
-)
-check("TC2: 1 thung, khoang cach 1 → h = 1", s2, 1, "==")
+    def test_one_push(self):
+        state = make_state([(0, 1)], [(1, 1)], [(2, 1)])
+        self.assertEqual(self.assert_admissible(state), 1)
+        self.assertEqual(estimate(state), 1)
 
-# ----------------------------------------------------------
-# TC3: 1 thung, 1 dich, khoang cach Manhattan = 3
-# ----------------------------------------------------------
-s3 = make_state(
-    robots=[(0, 0)],
-    boxes=[(0, 0)],
-    storage=[(2, 1)],  # Cach 2 ngang + 1 doc = 3
-)
-check("TC3: 1 thung, khoang cach 3 → h = 3", s3, 3, "==")
+    def test_walking_cost(self):
+        state = make_state([(0, 0)], [(2, 1)], [(3, 1)])
+        self.assertEqual(self.assert_admissible(state), 3)
+        self.assertEqual(estimate(state), 3)
 
-# ----------------------------------------------------------
-# TC4: 2 thung, moi thung gan 1 dich khac nhau
-# ----------------------------------------------------------
-s4 = make_state(
-    robots=[(0, 0)],
-    boxes=[(1, 0), (3, 0)],
-    storage=[(2, 0), (4, 0)],  # Moi thung cach dich gan nhat 1 buoc
-)
-check("TC4: 2 thung × 1 buoc = tong h = 2", s4, 2, "==")
+    def test_solvable_wall_detour(self):
+        state = make_state([(1, 1)], [(2, 1)], [(4, 2)],
+                           width=5, height=4, obstacles=[(3, 1)])
+        self.assert_admissible(state)
 
-# ----------------------------------------------------------
-# TC5: Admissibility — h phai <= so buoc thuc te (= 1)
-# Truong hop don gian: thung (1,0) -> dich (2,0), robot day sang phai 1 buoc
-# ----------------------------------------------------------
-s5 = make_state(
-    robots=[(0, 0)],
-    boxes=[(1, 0)],
-    storage=[(2, 0)],
-)
-check("TC5: Admissible — h <= 1 (so buoc thuc te)", s5, 1, "<=")
+    def test_multiple_boxes_and_robots(self):
+        state = make_state([(0, 0), (0, 2)], [(1, 0), (1, 2)],
+                           [(2, 0), (2, 2)])
+        self.assertEqual(self.assert_admissible(state), 2)
+        self.assertEqual(estimate(state), 2)
 
-# ----------------------------------------------------------
-# TC6: Nhieu dich hon thung — h chi tinh thung chua o dich
-# ----------------------------------------------------------
-s6 = make_state(
-    robots=[(0, 0)],
-    boxes=[(1, 1)],
-    storage=[(1, 1), (3, 3), (5, 5)],  # 3 dich, 1 thung da o dich
-)
-check("TC6: Thung da o dich (co nhieu dich hon thung) → h = 0", s6, 0, "==")
+    def test_partially_solved_with_extra_storage(self):
+        state = make_state([(0, 1)], [(1, 0), (1, 1)],
+                           [(1, 0), (2, 1), (3, 2)])
+        self.assertEqual(self.assert_admissible(state), 1)
 
-# ----------------------------------------------------------
-# TC7: Co tuong chan giua thung va dich — test admissible voi obstacles
-#
-# Ban co 5x3:
-#   . . . . .
-#   $ # . . *   <- thung (0,1), tuong (1,1), dich (4,1)
-#   . . . . .
-#
-# Manhattan tu thung (0,1) -> dich (4,1) = 4
-# Thuc te phai di vong: len (0,0), sang phai 4 buoc, xuong (4,1) = 6 buoc
-# Admissible: h <= 6 thuc te. Manhattan tra 4 <= 6 → VAN admissible.
-# Nhung neu dung BFS muc 2: se tra 6 (chinh xac hon).
-# ----------------------------------------------------------
-s7 = make_state(
-    robots=[(3, 0)],
-    boxes=[(0, 1)],
-    storage=[(4, 1)],
-    obstacles=[(1, 1)],   # Tuong chan ngang, buoc phai di vong
-    width=5, height=3,
-)
-check("TC7: Tuong chan giua, h_manhattan <= h_thuc_te=6 (admissible)", s7, 6, "<=")
+    def test_static_deadlocks(self):
+        # The old tests treated these as walking detours, ignoring push support.
+        boards = [
+            make_state([(3, 0)], [(0, 1)], [(4, 1)],
+                       width=5, height=3, obstacles=[(1, 1)]),
+            make_state([(0, 0)], [(2, 0)], [(4, 0)],
+                       width=5, height=3, obstacles=[(3, 0)]),
+        ]
+        for state in boards:
+            with self.subTest(boxes=state.boxes):
+                self.assertIsNone(optimal_moves(state))
+                self.assertEqual(estimate(state), float("inf"))
 
-# ----------------------------------------------------------
-# TC8: Kiem tra h > 0 khi thung CHUA o dich — du co obstacles
-# Bat buoc: ham khong duoc tra 0 (gia su da xong) khi thung van con xa dich
-# ----------------------------------------------------------
-s8 = make_state(
-    robots=[(0, 0)],
-    boxes=[(0, 2)],
-    storage=[(4, 2)],
-    obstacles=[(2, 1), (2, 2), (2, 3)],  # Tuong doc chan ngang ban co
-    width=5, height=5,
-)
-check("TC8: Thung chua o dich (du co tuong) → h > 0", s8, 0, ">0")
+    def test_cache_preserves_robot_distance_and_input(self):
+        near = make_state([(1, 1)], [(2, 1)], [(3, 1)])
+        far = make_state([(0, 0)], [(2, 1)], [(3, 1)])
+        cache = {}
+        for state, expected in [(near, 1), (far, 3), (near, 1)]:
+            before = (signature(state), state.action, state.gval, state.parent)
+            self.assertEqual(estimate(state, cache), expected)
+            self.assertEqual(estimate(state, cache), estimate(state))
+            self.assertEqual(
+                (signature(state), state.action, state.gval, state.parent), before)
 
-# ----------------------------------------------------------
-# TC_LEVEL: Test phan biet Muc 1 (Manhattan) vs Muc 2 (BFS thuc)
-#
-# Map 5x5, robot (0,0), storage (4,0)
-# Thung tai (2,0), tuong chan truc tiep: obstacles=[(3,0)]
-#
-#   R . $ # *     (R=robot, $=thung, #=tuong, *=dich)
-#   . . . . .
-#   . . . . .
-#
-# Manhattan(2,0 -> 4,0) = 2  (khong biet tuong)
-# BFS thuc: phai di vong qua (2,1)->(3,1)->(4,1)->(4,0) = 4
-#
-# MUC 1 (hien tai): h = 2  → admissible nhung uoc luong kem
-# MUC 2 (sau nang cap): h = 4 → chinh xac hon, A* chay nhanh hon nhieu
-# ----------------------------------------------------------
-s_level = make_state(
-    robots=[(0, 0)],
-    boxes=[(2, 0)],
-    storage=[(4, 0)],
-    obstacles=[(3, 0)],   # Tuong chan thang giua thung va dich
-    width=5, height=3,
-)
-precomputed_level = precompute(s_level)
-h_level = heuristic(s_level, precomputed_level["dist_table"])
+    def test_all_single_box_positions_on_small_boards(self):
+        cells = [(x, y) for x in range(3) for y in range(3)]
+        solved_cases = 0
+        for goal in [(0, 0), (1, 1), (2, 1)]:
+            for robot, box in permutations(cells, 2):
+                state = make_state([robot], [box], [goal], width=3, height=3)
+                optimum = optimal_moves(state)
+                if optimum is None:
+                    continue
+                with self.subTest(goal=goal, robot=robot, box=box):
+                    value = estimate(state)
+                    self.assertGreaterEqual(value, 0)
+                    self.assertLessEqual(value, optimum)
+                solved_cases += 1
+        self.assertGreater(solved_cases, 0)
 
-print()
-print("[PHAN BIET MUC 1 vs MUC 2] Map co tuong chan giua thung va dich:")
-print(f"  Manhattan thuc = 2  (khong tinh tuong)")
-print(f"  BFS thuc       = 4  (phai di vong qua tuong)")
-print(f"  heuristic() dang tra = {h_level}")
-if h_level == 2:
-    print("  → Dang o MUC 1 (Manhattan). Nang len Muc 2 de dat h=4.")
-elif h_level == 4:
-    print("  → Da o MUC 2 (BFS thuc)! PASS.")
-else:
-    print(f"  → Ket qua la {h_level} — kiem tra lai logic.")
+    def test_fixture_rejects_robot_on_box(self):
+        with self.assertRaises(ValueError):
+            make_state([(0, 0)], [(0, 0)], [(2, 1)])
 
-# Bat buoc: h phai admissible (<= khoang cach thuc te la 4)
-check("TC_LEVEL: Admissible du o muc nao (h <= 4 = khoang cach thuc)", s_level, 4, "<=")
-
-print()
-print("Tat ca test PASS! Ham heuristic() hoat dong dung.")
+    def test_full_matching_detects_competing_goals(self):
+        state = make_state([(0,0)], [(1,1),(1,2)], [(1,2),(5,2)],
+                           width=7, height=4, obstacles=[(3,y) for y in range(4)])
+        self.assertIsNone(optimal_moves(state))
+        self.assertEqual(estimate(state), float('inf'))
 
 
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
