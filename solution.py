@@ -7,6 +7,15 @@ from sokoban import SokobanState, sokoban_goal_state
 _DIRECTIONS = ((0, -1, "up"), (1, 0, "right"),
                (0, 1, "down"), (-1, 0, "left"))
 _WEIGHT = 3.0
+_FIRST_SEARCH_WEIGHTS = (_WEIGHT, 6.0, 10.0)
+# Per-attempt distinct-state cap, chosen for this experimental version.
+_FIRST_SEARCH_STATE_LIMIT = 250000
+# Optional improvement uses at most 25% of the original budget and 20 seconds.
+_IMPROVEMENT_MAX_SECONDS = 20.0
+_IMPROVEMENT_BUDGET_FRACTION = 0.25
+# Stop after two unsuccessful attempts, or 8 seconds without a better path.
+_IMPROVEMENT_MAX_STALLED_ATTEMPTS = 2
+_IMPROVEMENT_STALL_SECONDS = 8.0
 _CACHE_LIMIT = 100000
 _IMPROVEMENT_WEIGHTS = (2.0, 1.4, 1.0)
 _IMPROVEMENT_STATE_LIMIT = 100000
@@ -37,13 +46,12 @@ class _Node:
 
 
 class _Board:
-    def __init__(self, initial, deadline, full_matching):
+    def __init__(self, initial, deadline):
         self.width = initial.width
         self.height = initial.height
         self.storage = initial.storage
         self.obstacles = initial.obstacles
         self.deadline = deadline
-        self.full_matching = full_matching
         self.neighbors = {}
         for y in range(self.height):
             _check_time(deadline)
@@ -85,8 +93,7 @@ class _Board:
         if cached is not None:
             return cached
         result = (bool(boxes & self.dead_cells)
-                  or _is_frozen_deadlock(boxes, self)
-                  or _is_2x2_deadlock(boxes, self))
+                  or _is_frozen_deadlock(boxes, self))
         if len(self.deadlock_cache) >= _CACHE_LIMIT:
             self.deadlock_cache.clear()
         self.deadlock_cache[boxes] = result
@@ -96,13 +103,12 @@ class _Board:
         _check_time(deadline)
         if boxes <= self.storage:
             return 0
-        selected_boxes = boxes if self.full_matching else boxes - self.storage
-        push_cost = self.assignment_cache.get(selected_boxes)
+        push_cost = self.assignment_cache.get(boxes)
         if push_cost is None:
-            if len(selected_boxes) > len(self.goals):
+            if len(boxes) > len(self.goals):
                 return float("inf")
             costs = []
-            for box in sorted(selected_boxes):
+            for box in sorted(boxes):
                 _check_time(deadline)
                 costs.append([self.push_distances[goal].get(box, float("inf"))
                               for goal in self.goals])
@@ -111,7 +117,7 @@ class _Board:
             push_cost, _ = _hungarian_min_cost(costs, deadline)
             if len(self.assignment_cache) >= _CACHE_LIMIT:
                 self.assignment_cache.clear()
-            self.assignment_cache[selected_boxes] = push_cost
+            self.assignment_cache[boxes] = push_cost
         if push_cost == float("inf"):
             return push_cost
         # Before the first push, a robot must reach some box, including goal boxes.
@@ -249,64 +255,88 @@ def solve(initial_state, timebound=120):
     return _solve(initial_state, timebound)
 
 
-def _solve(initial_state, timebound=120, *, full_matching=True,
-           single_robot_push=True, stats=None):
-    """Private switches support controlled experiments; caches remain call-local."""
+def _find_first(initial, board, deadline, pushes, stats):
+    """Retry a bounded search with larger weights after a state-limit stop.
+
+    All attempts share a deadline. A state cap is not a hard byte limit:
+    heap entries, parent nodes, actions and caches also occupy memory.
+    """
+    for weight in _FIRST_SEARCH_WEIGHTS:
+        _check_time(deadline)
+        stats['first_attempts'].append((pushes, weight))
+        try:
+            return _search(initial, board, deadline, pushes, stats,
+                           weight=weight, state_limit=_FIRST_SEARCH_STATE_LIMIT)
+        except _SearchLimit:
+            stats['first_state_limits'] += 1
+        # The exception and its search frames have been released here.
+        board.assignment_cache.clear()
+        board.deadlock_cache.clear()
+    return None
+
+
+def _solve(initial_state, timebound=120, *, stats=None):
+    """Solve with bounded restarts and optional, limited improvement."""
     if stats is None:
         stats = {}
     stats.update(expanded=0, generated=0, peak_frontier=0, searches=[],
-                 first_steps=None, improvements=[], improvement_stop=None)
+                 first_steps=None, first_attempts=[], first_state_limits=0,
+                 improvements=[], improvement_stop=None)
     if timebound <= 0:
         return False
     deadline = time.perf_counter() + timebound - min(0.02, timebound * 0.02)
-    # Reserve time for releasing the frontier and reconstructing the final path.
-    search_deadline = deadline - min(1.0, timebound * 0.1)
+    # Reserve 5% on normal budgets; keep a bounded margin on short budgets.
+    reserve = min(max(1.0, timebound * 0.05), timebound * 0.2)
+    search_deadline = deadline - reserve
     if sokoban_goal_state(initial_state):
         return initial_state
     best_solution = False
     try:
-        board = _Board(initial_state, search_deadline, full_matching)
-        single_robot = len(initial_state.robots) == 1 and single_robot_push
+        board = _Board(initial_state, search_deadline)
+        single_robot = len(initial_state.robots) == 1
         large_map = initial_state.width * initial_state.height >= 64 and len(initial_state.boxes) >= 6
         node = None
         if single_robot:
-            node = _search(initial_state, board, search_deadline, True, stats)
+            node = _find_first(initial_state, board, search_deadline, True, stats)
         else:
-            # Multiple robots may need walking-only moves to make way for one another.
+            # Step search also allows robots to walk aside without pushing.
             if large_map:
                 push_deadline = min(search_deadline, time.perf_counter() +
                                     min(30.0, (search_deadline-time.perf_counter()) * 0.25))
                 try:
-                    node = _search(initial_state, board, push_deadline, True, stats)
+                    node = _find_first(initial_state, board, push_deadline, True, stats)
                 except _Timeout:
                     pass
             if node is None:
-                node = _search(initial_state, board, search_deadline, False, stats)
-        if node is not None:
-            # Materialize a valid fallback BEFORE starting optional searches.
-            best_solution = _reconstruct(initial_state, node, deadline)
-            stats['first_steps'] = best_solution.gval
-            node = None
-        if best_solution is False:
+                node = _find_first(initial_state, board, search_deadline, False, stats)
+        if node is None:
             return False
+        best_solution = _reconstruct(initial_state, node, deadline)
+        stats['first_steps'] = best_solution.gval
+        node = None
 
-        # Keep automatic GC enabled. Bound optional work and leave extra time
-        # to release its frontier; no hard real-time guarantee is claimed.
-        improvement_deadline = min(search_deadline,
-            deadline - min(max(1.0, timebound * 0.05), timebound * 0.2))
-        remaining = improvement_deadline - time.perf_counter()
-        if remaining <= 0:
-            return best_solution
         start = time.perf_counter()
-        # Restart each search with the tighter incumbent bound. Multi-robot
-        # improvements use step search so robots can walk out of each other's way.
+        improvement_budget = min(_IMPROVEMENT_MAX_SECONDS,
+                                 timebound * _IMPROVEMENT_BUDGET_FRACTION)
+        improvement_deadline = min(search_deadline, start + improvement_budget)
+        remaining = improvement_deadline - start
+        if remaining <= 0:
+            stats['improvement_stop'] = 'no_time_remaining'
+            return best_solution
+        stall_window = min(_IMPROVEMENT_STALL_SECONDS, timebound * 0.1)
+        last_improvement = start
+        stalled_attempts = 0
         for weight, fraction in zip(_IMPROVEMENT_WEIGHTS, (0.35, 0.70, 1.0)):
-            phase_deadline = min(improvement_deadline, start + remaining * fraction)
+            phase_deadline = start + remaining * fraction
             while time.perf_counter() < phase_deadline:
+                attempt_deadline = min(phase_deadline, last_improvement + stall_window)
+                if time.perf_counter() >= attempt_deadline:
+                    stats['improvement_stop'] = 'stalled_time'
+                    return best_solution
                 try:
-                    node = _search(initial_state, board, phase_deadline,
-                        single_robot, stats, weight, best_solution.gval,
-                        _IMPROVEMENT_STATE_LIMIT)
+                    node = _search(initial_state, board, attempt_deadline,
+                                   single_robot, stats, weight, best_solution.gval,
+                                   _IMPROVEMENT_STATE_LIMIT)
                     if node is None:
                         stats['improvement_stop'] = 'bounded_search_exhausted'
                         return best_solution
@@ -314,15 +344,26 @@ def _solve(initial_state, timebound=120, *, full_matching=True,
                     if candidate.gval < best_solution.gval:
                         best_solution = candidate
                         stats['improvements'].append((weight, candidate.gval))
+                        last_improvement = time.perf_counter()
+                        stalled_attempts = 0
                     node = None
                 except _SearchLimit:
                     stats['improvement_stop'] = 'state_limit'
+                    stalled_attempts += 1
                     break
                 except _Timeout:
                     stats['improvement_stop'] = 'phase_timeout'
+                    stalled_attempts += 1
                     break
+            if time.perf_counter() >= last_improvement + stall_window:
+                stats['improvement_stop'] = 'stalled_time'
+                return best_solution
+            if stalled_attempts >= _IMPROVEMENT_MAX_STALLED_ATTEMPTS:
+                stats['improvement_stop'] = 'stalled_attempts'
+                return best_solution
+        stats['improvement_stop'] = 'improvement_budget'
     except _Timeout:
-        pass
+        stats['improvement_stop'] = 'deadline'
     return best_solution
 
 
@@ -396,12 +437,11 @@ def _hungarian_min_cost(cost, deadline):
     return total_cost, assignment
 
 def _is_frozen_deadlock(boxes, board):
-    """Find a mutually frozen set; one fixed neighbor blocks an entire axis.
+   """Xác định một tập hợp các khối bị khóa lẫn nhau; một khối lân cận cố định sẽ chặn toàn bộ một trục.
 
-    Remove boxes with a potentially free axis until the set stops changing.
-    No remaining box can be pushed first: on each axis, either its destination
-    or the robot's support square is occupied by a wall or a remaining box.
-    Goal boxes participate as blockers but are not themselves a deadlock.
+    Loại bỏ các khối có trục còn khả năng di chuyển cho đến khi tập hợp này không còn thay đổi.
+    Khi đó, không còn khối nào có thể được đẩy trước: trên mỗi trục, vị trí đích của khối hoặc ô đứng của robot đều đã bị chặn bởi một bức tường hoặc một khối khác.
+    Các ô đích (goal boxes) đóng vai trò là vật cản, nhưng bản thân chúng không được coi là trạng thái bế tắc (deadlock).
     """
     width = board.width
     height = board.height
@@ -429,23 +469,3 @@ def _is_frozen_deadlock(boxes, board):
         frozen.difference_update(removable)
     return False
 
-def _is_2x2_deadlock(boxes, board):
-    """Detect a solid 2x2 block containing at least one non-goal box."""
-    width = board.width
-    height = board.height
-
-    def is_blocked(x, y):
-        return x < 0 or x >= width or y < 0 or y >= height or (x, y) in boxes or (x, y) in board.obstacles
-
-    for bx, by in boxes:
-        for dx, dy in [(0, 0), (-1, 0), (0, -1), (-1, -1)]:
-            cx, cy = bx + dx, by + dy
-            corners = [(cx, cy), (cx+1, cy), (cx, cy+1), (cx+1, cy+1)]
-            if not all(is_blocked(x, y) for x, y in corners):
-                continue
-            for cx2, cy2 in corners:
-                if (0 <= cx2 < width and 0 <= cy2 < height and
-                        (cx2, cy2) in boxes and
-                        (cx2, cy2) not in board.storage):
-                    return True
-    return False
