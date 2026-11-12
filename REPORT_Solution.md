@@ -89,13 +89,13 @@ Chi phí ghép và deadlock được cache theo vị trí thùng, còn phần ti
 | Nhiều robot, diện tích dưới 64 ô hoặc ít hơn 6 thùng | Step search | Step search |
 | Nhiều robot, diện tích ít nhất 64 ô và ít nhất 6 thùng | Thử push trước trong tối đa 30 giây hoặc 25% thời gian tìm còn lại, rồi step nếu chưa có nghiệm | Step search |
 
-Step search sinh một bước di chuyển của một robot. Push search dùng BFS tìm đường đi bộ ngắn nhất tới vị trí đứng đẩy, sau đó ghép với một lần đẩy. Một đoạn đi bộ 4 bước và đẩy 1 bước có chi phí 5. Trong BFS, chỉ các robot khác được coi là vật cản cố định, nên vị trí xuất phát của robot đang di chuyển có thể trở thành ô trống.
+Step search sinh một bước di chuyển của một robot. Push search dùng BFS tìm đường đi bộ ngắn nhất tới vị trí đứng đẩy, sau đó ghép với một lần đẩy. Một đoạn đi bộ 4 bước và đẩy 1 bước có chi phí 5. Trong BFS, thùng và các robot khác là vật cản; ô xuất phát của robot đang xét không bị chặn.
 
 Map nhiều robot có thể cần nước đi bộ độc lập để nhường đường. Step search biểu diễn được hành động này, còn nhánh push chỉ sinh đoạn kết thúc bằng một lần đẩy. Vì vậy, phần cải thiện dùng step search cho mọi map nhiều robot.
 
 Khóa trạng thái gồm vị trí robot đã sắp xếp và tập vị trí thùng. Cách sắp xếp gộp các cấu hình chỉ khác nhãn robot có cùng khả năng. Node vẫn giữ thứ tự robot thực tế để dựng đúng hành động. `best_cost` lưu chi phí nhỏ nhất đã biết. Đường rẻ hơn được đưa lại vào heap, bản ghi cũ bị bỏ khi lấy ra. Heap ưu tiên theo `(g+w*h, -g, serial)`.
 
-`_Node` dùng `__slots__` và lưu đoạn hành động của cạnh. `_reconstruct()` truy ngược cha, đảo thứ tự đoạn rồi tạo từng `SokobanState`, mỗi bước tăng `gval` đúng 1. Chỉ sau khi dựng xong, nghiệm mới được thay vào `best_solution`. Hai cờ thử nghiệm `full_matching` và `single_robot_push` đã được bỏ, các lựa chọn mặc định được cố định như mô tả trên.
+`_Node` dùng `__slots__` và lưu đoạn hành động của cạnh. `_reconstruct()` truy ngược cha, đảo thứ tự đoạn rồi tạo từng `SokobanState`, mỗi bước tăng `gval` đúng 1. Chỉ sau khi dựng xong, nghiệm mới được thay vào `best_solution`.
 
 ### 1.6. Giới hạn và điều kiện dừng
 
@@ -160,15 +160,14 @@ Bảng tổng hợp số bước của bản ban đầu và bản hiện tại t
 
 Cả hai bản đạt **20/20 PASS**. Tổng số bước giảm từ **818 xuống 733**, tức **85 bước, khoảng 10,4%**. Trung bình giảm từ **40,90 xuống 36,65 bước/map**. Bản hiện tại giữ kết quả public trong lượt đo đã thực hiện, còn khả năng giải test ẩn cần được kiểm tra thêm.
 
-Lượt đo hiện tại có tổng thời gian solve khoảng **34,158 giây**, cộng từ log từng map đã làm tròn. Thời gian chịu ảnh hưởng của máy và tải hệ thống. Các lượt của bản cũ diễn ra ở thời điểm khác nên chưa dùng để xác định mức tăng tốc do riêng bounded.. Tổng số map được bounded xác nhận tối ưu chưa được thống kê trong lượt đo này.
-
+Tổng thời gian solve cộng từ các giá trị đã làm tròn trong bảng là **5,356 giây** cho bản ban đầu và **45,841 giây** cho bản hiện tại. Thời gian chịu ảnh hưởng của máy và tải hệ thống.
 ### 3.2. Kiểm tra bổ sung và lựa chọn cấu hình
 
-Bản hiện tại đạt **37/37 test**, gồm kiểm tra heuristic trên bàn nhỏ, frozen, lời giải dự phòng khi bị ngắt và benchmark public. Kiểm tra điều khiển xác nhận fallback đi qua các weight 3, 6, 10 dưới cùng deadline và các luật dừng giữ được nghiệm hợp lệ.
+Bản hiện tại đã vượt qua các kiểm tra heuristic trên bàn nhỏ, frozen, giữ nghiệm dự phòng khi bị ngắt và benchmark public. Kiểm tra điều khiển xác nhận fallback đi qua các weight 3, 6, 10 dưới cùng deadline và các luật dừng giữ được nghiệm hợp lệ.
 
 Một kiểm tra ép trần tìm đầu xuống 200 trạng thái trên map 18 cho thấy cả sáu lần push/step đều chạm trần. Solver trả `False` sau khoảng **0,0255 giây** với ngân sách 120 giây. Ca này xác nhận hạn chế hết lượt fallback dù còn thời gian. Đây là phép thử với ngưỡng giảm để kích hoạt nhánh xử lý, chưa xác định map nào gặp đủ sáu lần chạm trần ở mức 250k thực tế.
 
-Nhóm từng thử tăng trần cải thiện lên 1M và phối hợp push/step trong các bản trước. Một số lượt cho cost tốt hơn nhưng thời gian và RAM tăng. Nhóm chọn bounded để kiểm soát lượng công việc, đồng thời vẫn giữ tổng 733 bước trên public. Hiệu quả giảm RAM trên map khó chưa được xác nhận bằng phép đo tương ứng của bản hiện tại.
+Nhóm từng thử tăng trần cải thiện lên 1M và phối hợp push/step trong các bản trước. Một số lượt cho cost tốt hơn nhưng thời gian và RAM tăng. Nhóm chọn bản hiện tại để kiểm soát lượng công việc, đồng thời vẫn giữ tổng 733 bước trên public. Hiệu quả giảm RAM trên map khó chưa được xác nhận bằng phép đo tương ứng của bản hiện tại.
 
 ## 4. Hạn chế và nguồn tham khảo
 

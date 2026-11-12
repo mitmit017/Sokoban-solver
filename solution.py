@@ -8,7 +8,7 @@ _DIRECTIONS = ((0, -1, "up"), (1, 0, "right"),
                (0, 1, "down"), (-1, 0, "left"))
 _WEIGHT = 3.0
 _FIRST_SEARCH_WEIGHTS = (_WEIGHT, 6.0, 10.0)
-# Per-attempt distinct-state cap, chosen for this experimental version.
+
 _FIRST_SEARCH_STATE_LIMIT = 250000
 # Optional improvement uses at most 25% of the original budget and 20 seconds.
 _IMPROVEMENT_MAX_SECONDS = 20.0
@@ -437,11 +437,11 @@ def _hungarian_min_cost(cost, deadline):
     return total_cost, assignment
 
 def _is_frozen_deadlock(boxes, board):
-   """Xác định một tập hợp các khối bị khóa lẫn nhau; một khối lân cận cố định sẽ chặn toàn bộ một trục.
+    """Detect a frozen group containing a box outside storage.
 
-    Loại bỏ các khối có trục còn khả năng di chuyển cho đến khi tập hợp này không còn thay đổi.
-    Khi đó, không còn khối nào có thể được đẩy trước: trên mỗi trục, vị trí đích của khối hoặc ô đứng của robot đều đã bị chặn bởi một bức tường hoặc một khối khác.
-    Các ô đích (goal boxes) đóng vai trò là vật cản, nhưng bản thân chúng không được coi là trạng thái bế tắc (deadlock).
+    Remove boxes with a potentially free axis until the set stops changing.
+    A wall or remaining box on either side blocks movement on that axis.
+    Goal boxes remain blockers, but a group entirely on goals is accepted.
     """
     width = board.width
     height = board.height
